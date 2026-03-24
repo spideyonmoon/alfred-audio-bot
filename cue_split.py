@@ -135,8 +135,11 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
         work_dir       = state["work_dir"]
         local_cue_path = os.path.join(work_dir, "input.cue")
 
-        # Download CUE
-        await client.download_media(message, file_name=local_cue_path)
+        # Download CUE in-memory to avoid Pyrogram tiny-file shutil.move bug
+        cue_io = await client.download_media(message, in_memory=True)
+        if cue_io:
+            with open(local_cue_path, "wb") as f:
+                f.write(cue_io.getbuffer())
 
         # Clean up prompts
         try:
@@ -176,7 +179,11 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
         work_dir       = state["work_dir"]
         local_art_path = os.path.join(work_dir, "cover.jpg")
 
-        await client.download_media(message, file_name=local_art_path)
+        art_io = await client.download_media(message, in_memory=True)
+        if art_io:
+            with open(local_art_path, "wb") as f:
+                f.write(art_io.getbuffer())
+                
         state["cover_path"]  = local_art_path
         state["art_msg_id"]  = message.id
 
