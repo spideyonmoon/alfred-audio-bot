@@ -1,0 +1,6 @@
+pyrofork
+TgCrypto
+httpx
+python-dotenv
+numpy
+mutagen

@@ -1,0 +1,8 @@
+services:
+  alfred:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      # Persist Pyrogram session file across restarts
+      - .:/app
