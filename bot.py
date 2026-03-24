@@ -466,9 +466,9 @@ async def help_command(client: Client, message: Message):
     await message.reply(text)
 
 # ---------------------------------------------------------------------------
-# /stats
+# /stats + /status
 # ---------------------------------------------------------------------------
-@app.on_message(filters.command("stats"))
+@app.on_message(filters.command(["stats", "status"]))
 async def stats_command(client: Client, message: Message):
     uptime_sec = int(time.monotonic() - _start_time)
     h, rem     = divmod(uptime_sec, 3600)
