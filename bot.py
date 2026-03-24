@@ -331,6 +331,7 @@ async def _run_forensic_job(job: dict):
         start_time = time.time()
         file_path_str = await client.download_media(
             message=replied,
+            file_name="/tmp/downloads/",
             progress=progress_callback,
             progress_args=(status_msg, "Downloading Audio", start_time, [0.0])
         )
