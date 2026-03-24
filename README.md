@@ -42,6 +42,7 @@ app_port: 7860
 | `TELEGRAPH_TOKEN` | Telegraph access token (optional) |
 | `ALLOWED_CHATS` | JSON: `{"-100chatid": [0, topic_id]}` |
 | `ALLOWED_TOPICS` | JSON: `[topic_id1, topic_id2]` |
+| `ADMIN_IDS` | JSON: `[userid1, userid2]` (these users bypass chat checks) |
 
 ---
 

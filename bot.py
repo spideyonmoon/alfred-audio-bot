@@ -41,6 +41,7 @@ except json.JSONDecodeError:
     pass
 
 ALLOWED_TOPICS: set = set(json.loads(os.getenv("ALLOWED_TOPICS", "[]")))
+ADMIN_IDS: set[int] = set(json.loads(os.getenv("ADMIN_IDS", "[]")))
 MAX_FILE_SIZE_MB = 1500
 
 logging.basicConfig(
@@ -76,6 +77,9 @@ _current_job:    Optional[dict] = None           # {"user_id": int, "filename": 
 # Auth helper
 # ---------------------------------------------------------------------------
 def _check_auth(message: Message) -> bool:
+    if message.from_user and message.from_user.id in ADMIN_IDS:
+        return True
+
     chat_id  = message.chat.id
     topic_id = message.message_thread_id or 0
     if chat_id not in ALLOWED_CHATS:
