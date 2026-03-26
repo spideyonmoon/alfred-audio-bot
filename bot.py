@@ -595,14 +595,15 @@ async def _on_start():
     then spawn the worker and idle."""
     from pyrogram import idle
     
+    # On HuggingFace Spaces, SPACE_ID env var is set automatically.
+    # Start the minimal health server IMMEDIATELY so HF startup probes pass
+    # BEFORE Pyrogram blocks to negotiate the MTProto connection to Telegram.
+    if os.getenv("SPACE_ID"):
+        asyncio.create_task(health.start_health_server(port=7860))
+        logger.info("HuggingFace Space detected — health server started on :7860")
+
     async with app:
         logger.info("Alfred (MTProto) is now online and standing by.")
-
-        # On HuggingFace Spaces, SPACE_ID env var is set automatically.
-        # Start a minimal health server so the Space shows as 'Running'.
-        if os.getenv("SPACE_ID"):
-            asyncio.create_task(health.start_health_server(port=7860))
-            logger.info("HuggingFace Space detected — health server started on :7860")
 
         worker = asyncio.create_task(_queue_worker())
         try:
