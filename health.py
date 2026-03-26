@@ -23,8 +23,19 @@ _RESPONSE = (
 
 async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
-        await reader.read(1024)  # consume the incoming HTTP request
-        writer.write(_RESPONSE)
+        request = await reader.read(1024)  # consume the incoming HTTP request
+        req_str = request.decode("utf-8", errors="ignore")
+        if "GET /crash" in req_str:
+            import os
+            if os.path.exists("/tmp/crash.log"):
+                with open("/tmp/crash.log", "r", encoding="utf-8") as f:
+                    err = f.read()
+                resp = f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{err}".encode("utf-8")
+                writer.write(resp)
+            else:
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nNo crash log found.")
+        else:
+            writer.write(_RESPONSE)
         await writer.drain()
     except Exception:
         pass

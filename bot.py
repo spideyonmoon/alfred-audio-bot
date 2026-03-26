@@ -614,4 +614,14 @@ if __name__ == "__main__":
     if not BOT_TOKEN or not API_ID or not API_HASH:
         logger.error("Missing critical environment variables (BOT_TOKEN, API_ID, or API_HASH).")
     else:
-        app.run(_on_start())
+        try:
+            app.run(_on_start())
+        except Exception as e:
+            import traceback
+            import health
+            with open("/tmp/crash.log", "w", encoding="utf-8") as f:
+                traceback.print_exc(file=f)
+            logger.error("Fatal startup error. Storing traceback to /tmp/crash.log and starting debug health server.")
+            async def serve_crash():
+                await health.start_health_server(port=7860)
+            asyncio.run(serve_crash())
