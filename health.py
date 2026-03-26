@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 _RESPONSE = (
     b"HTTP/1.1 200 OK\r\n"
     b"Content-Type: text/plain\r\n"
-    b"Content-Length: 8\r\n"
+    b"Content-Length: 9\r\n"
     b"Connection: close\r\n"
     b"\r\n"
     b"Alfred OK"
