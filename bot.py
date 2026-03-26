@@ -52,12 +52,12 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-SESSION_STRING = os.getenv("SESSION_STRING")
+# On HuggingFace, run purely in-memory to safely isolate Auth Keys from local runs
+is_hf = bool(os.getenv("SPACE_ID"))
 
 app = Client(
-    name="alfred_session" if not SESSION_STRING else "memory",
-    session_string=SESSION_STRING,
-    in_memory=True if SESSION_STRING else False,
+    name=":memory:" if is_hf else "alfred_session",
+    in_memory=is_hf,
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
