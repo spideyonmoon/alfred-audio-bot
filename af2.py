@@ -418,12 +418,12 @@ class SpectralEngine:
     def _freq_bins(self) -> "np.ndarray": return np.fft.rfftfreq(self.WINDOW, 1.0 / self.sample_rate)
 
     @staticmethod
-    def _interp_variance(var: float) -> str:
+    def _interp_variance(var: float, legit_cutoff: bool) -> str:
         if var < 1000: return "[rigid/encoded-like]"
         elif var < 10000: return "[stable: normal for mastered audio]"
         elif var < 100000: return "[moderate: natural organic fluctuation]"
-        elif var < 1000000: return "[high variation: organic/analog source]"
-        else: return "[very high variation: complex analog source]"
+        elif var < 1000000: return "[high variation: organic/analog source]" if legit_cutoff else "[erratic cutoff: typical of VBR lossy encoders like AAC/Opus]"
+        else: return "[very high variation: complex analog source]" if legit_cutoff else "[erratic cutoff: typical of VBR lossy encoders like AAC/Opus]"
 
     @staticmethod
     def _interp_sharpness(s: float) -> str:
@@ -462,11 +462,11 @@ class SpectralEngine:
         else: return "[severe anomaly: artificial stereo width or heavy compression]"
 
     @staticmethod
-    def _interp_entropy(e: float) -> str:
+    def _interp_entropy(e: float, legit_cutoff: bool) -> str:
         if e < 7.0: return "[low: simple/tonal content]"
         elif e < 8.5: return "[moderate: typical music complexity]"
-        elif e < 9.5: return "[high: complex/dynamic content]"
-        else: return "[very high: noise-like complexity]"
+        elif e < 9.5: return "[high: complex/dynamic content]" if legit_cutoff else "[high entropy: lossy noise-shaping / VBR footprint]"
+        else: return "[very high: noise-like complexity]" if legit_cutoff else "[very high entropy: lossy ultrasonic noise / dithering]"
 
     def _cutoff_per_frame(self, frames: "np.ndarray", bins: "np.ndarray") -> "np.ndarray":
         cutoffs = []
@@ -664,14 +664,16 @@ class SpectralEngine:
         net_score = max(0, lossy_score - natural_score)
         label, sentence, caveats = self._verdict(net_score, cutoff_hz, dsd_detected)
 
+        legit_cutoff = cutoff_hz > (self.nyquist * 0.85)
+
         result.cutoff_hz, result.cutoff_hz_str = cutoff_hz, f"{int(cutoff_hz):,} Hz"
-        result.cutoff_variance, result.cutoff_variance_interp = cutoff_var, self._interp_variance(cutoff_var)
+        result.cutoff_variance, result.cutoff_variance_interp = cutoff_var, self._interp_variance(cutoff_var, legit_cutoff)
         result.cutoff_sharpness_db, result.cutoff_sharpness_interp = sharpness, self._interp_sharpness(sharpness)
         result.hf_energy_ratio, result.hf_energy_interp = hf_ratio, self._interp_hf_ratio(hf_ratio)
         result.banding_score, result.banding_interp = banding, self._interp_banding(banding)
         result.nf_above_cutoff_db, result.nf_interp = nf_above, self._interp_nf(nf_above)
         result.side_anomaly_score, result.side_interp = side_anomaly, self._interp_side(side_anomaly)
-        result.entropy, result.entropy_interp = entropy, self._interp_entropy(entropy)
+        result.entropy, result.entropy_interp = entropy, self._interp_entropy(entropy, legit_cutoff)
         result.lpf_detected, result.lpf_cutoff_str, result.dsd_detected = lpf_detected, lpf_s, dsd_detected
         result.lossy_score, result.natural_score, result.net_score, result.max_score = lossy_score, natural_score, net_score, self.MAX_LOSSY_SCORE
         result.raw_lossy_pct = min(100.0, lossy_score / self.MAX_LOSSY_SCORE * 100.0) if lossy_score > 0 else 0.0

@@ -250,14 +250,14 @@ def make_telegraph_content(report: ForensicReport, include_assessment: bool = Tr
             if getattr(sp, "dsd_detected", False):
                 verdict_lines.extend(add_line("Ultrasonic Noise: ", "⚠ DSD/SACD Transcode Profile detected"))
             verdict_lines.extend(add_line("HF Cutoff: ",         sp.cutoff_hz_str))
-            verdict_lines.extend(add_line("Cutoff Variance: ",   f"{sp.cutoff_variance:.1f} Hz² [{sp.cutoff_variance_interp}]"))
-            verdict_lines.extend(add_line("Cliff Sharpness: ",   f"{sp.cutoff_sharpness_db:.1f} dB/bin [{sp.cutoff_sharpness_interp}]"))
-            verdict_lines.extend(add_line("HF Energy Ratio: ",   f"{sp.hf_energy_ratio:.5f} [{sp.hf_energy_interp}]"))
-            verdict_lines.extend(add_line("Side Anomaly: ",      f"{sp.side_anomaly_score:.3f} [{sp.side_interp}]"))
-            verdict_lines.extend(add_line("Banding Score: ",     f"{sp.banding_score:.3f} [{sp.banding_interp}]"))
-            verdict_lines.extend(add_line("NF Above Cutoff: ",   f"{sp.nf_above_cutoff_db:.1f} dB [{sp.nf_interp}]"))
+            verdict_lines.extend(add_line("Cutoff Variance: ",   f"{sp.cutoff_variance:.1f} Hz² {sp.cutoff_variance_interp}".strip()))
+            verdict_lines.extend(add_line("Cliff Sharpness: ",   f"{sp.cutoff_sharpness_db:.1f} dB/bin {sp.cutoff_sharpness_interp}".strip()))
+            verdict_lines.extend(add_line("HF Energy Ratio: ",   f"{sp.hf_energy_ratio:.5f} {sp.hf_energy_interp}".strip()))
+            verdict_lines.extend(add_line("Side Anomaly: ",      f"{sp.side_anomaly_score:.3f} {sp.side_interp}".strip()))
+            verdict_lines.extend(add_line("Banding Score: ",     f"{sp.banding_score:.3f} {sp.banding_interp}".strip()))
+            verdict_lines.extend(add_line("NF Above Cutoff: ",   f"{sp.nf_above_cutoff_db:.1f} dB {sp.nf_interp}".strip()))
             verdict_lines.extend(add_line("Low-Pass Filter: ",   "Detected" if sp.lpf_detected else "None detected"))
-            verdict_lines.extend(add_line("Spectral Entropy: ",  f"{sp.entropy:.3f} [{sp.entropy_interp}]"))
+            verdict_lines.extend(add_line("Spectral Entropy: ",  f"{sp.entropy:.3f} {sp.entropy_interp}".strip()))
 
             nodes.append(tag("p", *verdict_lines))
 
