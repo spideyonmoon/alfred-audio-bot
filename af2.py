@@ -72,7 +72,7 @@ class LoudnessProfile:
     flat_factor: str = ""; peak_count: str = ""; sox_entropy: str = ""; dc_offset: str = ""
     zero_crossings_rate: str = ""; lufs_integrated: str = ""; lufs_range: str = ""
     true_peak_dbtp: str = ""; lufs_momentary_max: str = ""; lufs_shortterm_max: str = ""
-    spotify_delta: str = ""; youtube_delta: str = ""
+    apple_music_delta: str = ""; spotify_delta: str = ""
 
 @dataclass
 class SpectralAnalysis:
@@ -87,7 +87,8 @@ class SpectralAnalysis:
     lpf_detected: bool = False; lpf_cutoff_str: str = ""
     dsd_detected: bool = False; lossy_score: int = 0
     natural_score: int = 0; net_score: int = 0; max_score: int = 0
-    confidence_pct: float = 0.0; verdict_label: str = ""; primary_verdict: str = ""
+    raw_lossy_pct: float = 0.0; net_confidence_pct: float = 0.0
+    verdict_label: str = ""; primary_verdict: str = ""
     evidence: list[str] = field(default_factory=list)
     natural_evidence: list[str] = field(default_factory=list)
     caveats: list[str] = field(default_factory=list)
@@ -165,7 +166,7 @@ class _TempWAV:
         fd, tmp = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         self._tmp = Path(tmp)
-        _run(["ffmpeg", "-y", "-i", str(self.filepath), "-vn", "-ar", "44100", "-ac", "2", "-sample_fmt", "s16", str(self._tmp)])
+        _run(["ffmpeg", "-y", "-i", str(self.filepath), "-vn", "-ac", "2", "-sample_fmt", "s16", str(self._tmp)])
         return self._tmp
 
     def __exit__(self, *_):
@@ -223,8 +224,8 @@ def extract_loudness(filepath: Path) -> LoudnessProfile:
     if lp.lufs_integrated:
         try:
             measured = float(lp.lufs_integrated)
+            lp.apple_music_delta = f"{-16.0 - measured:+.1f} dB"
             lp.spotify_delta = f"{-14.0 - measured:+.1f} dB"
-            lp.youtube_delta = f"{-14.0 - measured:+.1f} dB"
         except ValueError: pass
 
     return lp
@@ -290,9 +291,16 @@ def map_silence(filepath: Path, duration_sec: float) -> tuple[str, list[str]]:
     r = _run(["ffmpeg", "-i", str(filepath), "-vn", "-af", "silencedetect=noise=-60dB:d=0.5", "-f", "null", "-"])
     starts = [float(m) for m in re.findall(r"silence_start:\s*([\d.]+)", r.stderr)]
     ends = [float(m) for m in re.findall(r"silence_end:\s*([\d.]+)", r.stderr)]
+    eof_padded = False
+    if len(starts) > len(ends):
+        ends.append(duration_sec)
+        eof_padded = True
     total_silent = sum(e - s for s, e in zip(starts, ends))
     pct = (total_silent / duration_sec * 100) if duration_sec > 0 else 0
-    sections = [f"{int(s//60):02d}:{int(s%60):02d} → {int(e//60):02d}:{int(e%60):02d} ({e-s:.1f}s)" for s, e in zip(starts, ends)]
+    sections = []
+    for i, (s, e) in enumerate(zip(starts, ends)):
+        marker = " → EOF" if eof_padded and i == len(starts) - 1 else ""
+        sections.append(f"{int(s//60):02d}:{int(s%60):02d} → {int(e//60):02d}:{int(e%60):02d} ({e-s:.1f}s){marker}")
     return f"{pct:.1f}%", sections
 
 def audit_replaygain(tags: AudioTags, lufs_integrated: str) -> tuple[str, str, str, str]:
@@ -301,7 +309,7 @@ def audit_replaygain(tags: AudioTags, lufs_integrated: str) -> tuple[str, str, s
     try:
         stored_db = float(re.sub(r"[^\d.\-]", "", stored_raw.split()[0]))
         measured_lufs = float(lufs_integrated)
-        implied_level = -18.0 - stored_db
+        implied_level = -18.0 + stored_db
         delta = abs(implied_level - measured_lufs)
         if delta < 1.0: verdict = "✓ RG tag matches measured loudness"
         elif delta < 3.0: verdict = f"~ {delta:.1f} dB mismatch — minor discrepancy"
@@ -309,8 +317,6 @@ def audit_replaygain(tags: AudioTags, lufs_integrated: str) -> tuple[str, str, s
         return stored_raw, f"{measured_lufs:.2f} LUFS", f"{delta:.1f} dB", verdict
     except (ValueError, IndexError): return stored_raw, lufs_integrated, "", ""
 
-# Formats SoX can handle natively (no transcode needed)
-_SOX_NATIVE_SPEC = {".flac", ".wav", ".aiff", ".aif", ".w64", ".caf", ".snd", ".au"}
 
 def generate_spectrogram(filepath: Path) -> Path:
     """Generates a clean mono spectrogram.
@@ -375,7 +381,7 @@ class SpectralEngine:
     SCORE_CUTOFF_WELL_BELOW_NYQUIST = 2; SCORE_SHARP_CLIFF_HARD = 3; SCORE_SHARP_CLIFF_SOFT = 1
     SCORE_HF_NEAR_ZERO = 1; SCORE_VOID_ABOVE_CUTOFF = 3; SCORE_QUIET_ABOVE_CUTOFF = 1
     SCORE_VERY_STABLE_CUTOFF = 1; SCORE_BANDING_STRONG = 1; SCORE_SIDE_ANOMALY = 2
-    MAX_LOSSY_SCORE = 15
+    MAX_LOSSY_SCORE = 14
     NATURAL_GRADUAL_ROLLOFF = 1; NATURAL_HIGH_VARIANCE = 1; NATURAL_MODERATE_VARIANCE = 1   
     NATURAL_RICH_HF = 1; NATURAL_HF_NOISE = 1; NATURAL_HEALTHY_SIDE = 1; NATURAL_HIGH_ENTROPY = 1
     MP3_CUTOFFS = {320: 20500, 256: 20000, 192: 19000, 160: 18500, 128: 16000, 96: 15500, 64: 12000}
@@ -464,8 +470,9 @@ class SpectralEngine:
         else: return "[very high: noise-like complexity]"
 
     def _cutoff_per_frame(self, frames: "np.ndarray", bins: "np.ndarray") -> "np.ndarray":
-        ref = frames.max() + 1e-12; cutoffs = []
+        cutoffs = []
         for frame in frames:
+            ref = frame.max() + 1e-12
             db = 20.0 * np.log10(frame / ref + 1e-12)
             above = np.where(db > self.CUTOFF_DB)[0]
             cutoffs.append(float(bins[above[-1]]) if len(above) else 0.0)
@@ -483,11 +490,15 @@ class SpectralEngine:
         return float(frames[:, int(threshold_hz / (bins[1] - bins[0])):].sum()) / (float(frames.sum()) + 1e-12)
 
     def _banding_score(self, frames: "np.ndarray", bins: "np.ndarray", cutoff_hz: float, scan_hz: float = 1500.0) -> float:
-        bin_hz = bins[1] - bins[0]; hi = int(cutoff_hz / bin_hz)
-        region = frames.mean(axis=0)[max(0, hi - int(scan_hz / bin_hz)):hi]
-        if len(region) < 4: return 0.0
-        db = 20.0 * np.log10(region / (region.max() + 1e-12) + 1e-12)
-        return float(np.clip(1.0 - (db.std() / 25.0), 0.0, 1.0))
+        bin_hz = bins[1] - bins[0]
+        hi = int(cutoff_hz / bin_hz)
+        lo = max(0, hi - int(scan_hz / bin_hz))
+        region = frames[:, lo:hi]  # shape: (n_frames, n_bins)
+        if region.shape[1] < 4: return 0.0
+        # low temporal variance = unnaturally stable = banding
+        temporal_var = np.var(region, axis=0).mean()
+        # normalise — tune the divisor against known lossy/lossless pairs
+        return float(np.clip(1.0 - (temporal_var / 0.01), 0.0, 1.0))
 
     def _noise_floor_above_cutoff(self, frames: "np.ndarray", bins: "np.ndarray", cutoff_hz: float) -> float:
         above = frames[:, int(cutoff_hz / (bins[1] - bins[0])):]
@@ -496,18 +507,37 @@ class SpectralEngine:
 
     def _side_channel_anomaly(self, mid: "np.ndarray", side: "np.ndarray", bins: "np.ndarray") -> float:
         if not _NUMPY_OK or mid is None or side is None or len(mid) < self.WINDOW * 2: return 0.0
-        score, wt = 0.0, 0.0
-        e_ratio = float(np.sqrt(np.mean(side ** 2))) / (float(np.sqrt(np.mean(mid ** 2))) + 1e-12)
-        if e_ratio < 0.02: score += 1.0; wt += 1.0
-        elif e_ratio < 0.08: score += 0.6; wt += 1.0
-        else: wt += 1.0
-        return float(score / wt) if wt > 0 else 0.0
+        mid_frames = self._compute_frames(mid)
+        side_frames = self._compute_frames(side)
+        
+        # Focus exclusively on high frequencies (> 10 kHz) for joint-stereo anomaly detection
+        bin_hz = bins[1] - bins[0]
+        idx_10k = int(10000 / bin_hz)
+        if idx_10k >= mid_frames.shape[1]: return 0.0
+        
+        mid_hf = mid_frames[:, idx_10k:]
+        side_hf = side_frames[:, idx_10k:]
+        
+        e_ratio = float(np.mean(side_hf)) / (float(np.mean(mid_hf)) + 1e-12)
+        score, wt = 0.0, 1.0
+        if e_ratio < 0.02: score += 1.0
+        elif e_ratio < 0.08: score += 0.6
+        return float(score / wt)
 
     def _lpf_scan(self, frames: "np.ndarray", bins: "np.ndarray") -> tuple[bool, str]:
-        thz = self.nyquist * 0.90; top = frames[:, int(thz / (bins[1] - bins[0])):]
+        thz = self.nyquist * 0.90
+        bin_hz = bins[1] - bins[0]
+        top_idx = int(thz / bin_hz)
+        top = frames[:, top_idx:]
         if top.size == 0: return False, ""
-        detected = (float(top.sum()) / (float(frames.sum()) + 1e-12)) < 0.00005
-        return detected, f"~{int(thz / 1000)}kHz" if detected else ""
+        if (float(top.sum()) / (float(frames.sum()) + 1e-12)) >= 0.00005: return False, ""
+        
+        avg = frames.mean(axis=0)
+        ref = avg.max() + 1e-12
+        for i in range(top_idx, 0, -1):
+            if 20 * np.log10(avg[i] / ref + 1e-12) > -40.0:
+                return True, f"~{int(bins[i] / 1000)}kHz"
+        return True, "< 1kHz"
 
     def _dsd_scan(self, frames: "np.ndarray", bins: "np.ndarray") -> bool:
         if self.sample_rate <= 48000: return False
@@ -639,7 +669,8 @@ class SpectralEngine:
         result.entropy, result.entropy_interp = entropy, self._interp_entropy(entropy)
         result.lpf_detected, result.lpf_cutoff_str, result.dsd_detected = lpf_detected, lpf_s, dsd_detected
         result.lossy_score, result.natural_score, result.net_score, result.max_score = lossy_score, natural_score, net_score, self.MAX_LOSSY_SCORE
-        result.confidence_pct = min(100.0, net_score / self.MAX_LOSSY_SCORE * 100.0) if net_score > 0 else 0.0
+        result.raw_lossy_pct = min(100.0, lossy_score / self.MAX_LOSSY_SCORE * 100.0) if lossy_score > 0 else 0.0
+        result.net_confidence_pct = min(100.0, net_score / self.MAX_LOSSY_SCORE * 100.0) if net_score > 0 else 0.0
         result.verdict_label, result.primary_verdict = label, sentence
         result.evidence, result.natural_evidence, result.caveats = lossy_ev, natural_ev, caveats
         return result
@@ -654,8 +685,16 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
     dr = measure_dynamic_range(filepath)
     spec_path = generate_spectrogram(filepath)
 
-    sample_rate = int(tech.sample_rate) if tech.sample_rate.isdigit() else 44100
-    channels = int(tech.channels) if tech.channels.isdigit() else 2
+    try:
+        sample_rate = int(tech.sample_rate.strip())
+    except (ValueError, AttributeError):
+        print("Warning: could not parse sample_rate, defaulting to 44100", file=sys.stderr)
+        sample_rate = 44100
+
+    try:
+        channels = int(tech.channels.strip())
+    except (ValueError, AttributeError):
+        channels = 2
     try: claimed_depth = int(tech.precision.replace("-bit", "").strip())
     except ValueError: claimed_depth = 0
 
@@ -731,8 +770,8 @@ def _crest_colour(db: str) -> str:
     if v is None: return C.WHITE
     if v >= 12: return C.GREEN
     if v >= 8: return C.WHITE
-    if v >= 5: return C.WHITE
-    if v >= 3: return C.YELLOW
+    if v >= 5: return C.YELLOW
+    if v >= 3: return C.ORANGE
     return C.RED
 
 def _flat_colour(v: str) -> str:
@@ -795,7 +834,7 @@ def _headroom_bar(noise_db: str, rms_db: str, peak_db: str, *, width: int = 42) 
     return [
         f"  {_c(C.GREY, '[')} {''.join(bar)} {_c(C.GREY, ']')}",
         f"   {_c(C.GREY, '-120' + ' ' * 12 + '-60' + ' ' * 9 + '-30' + ' ' * 5 + '-10  0 dBFS')}",
-        f"   {_c(C.GREY,'·')} noise  {_c(C.BLUE,'▒')} RMS  {_c(C.GREEN,'█')} signal  {_c(C.YELLOW,'▐')} peak",
+        f"   {_c(C.GREY,'·')} noise  {_c(C.BLUE,'▒')} RMS  {_c(C.GREEN,'█')} signal  {_c(_peak_colour(peak_db),'▐')} peak",
     ]
 
 _CLIP_KEYS = {"maximumAmplitude", "minimumAmplitude"}
@@ -829,7 +868,7 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     for row in [_kv("LUFS Integrated", _c(_lufs_colour(lp.lufs_integrated), f"{lp.lufs_integrated} LUFS" if lp.lufs_integrated else "")), _kv("Loudness Range", f"{lp.lufs_range} LU" if lp.lufs_range else ""), _kv("True Peak", _c(_peak_colour(lp.true_peak_dbtp), f"{lp.true_peak_dbtp} dBTP" if lp.true_peak_dbtp else "")), _kv("Momentary Max", f"{lp.lufs_momentary_max} LUFS" if lp.lufs_momentary_max else ""), _kv("Short-term Max", f"{lp.lufs_shortterm_max} LUFS" if lp.lufs_shortterm_max else "")]:
         if row: print(row)
     print(_subsection("Streaming Normalization"))
-    for row in [_kv("Spotify (−14 LUFS)", _c(_delta_colour(lp.spotify_delta), lp.spotify_delta)), _kv("YouTube (−14 LUFS)", _c(_delta_colour(lp.youtube_delta), lp.youtube_delta))]:
+    for row in [_kv("Apple Music (−16 LUFS)", _c(_delta_colour(lp.apple_music_delta), lp.apple_music_delta)), _kv("Spotify/Tidal (−14 LUFS)", _c(_delta_colour(lp.spotify_delta), lp.spotify_delta))]:
         if row: print(row)
     print(_subsection("Dynamic Quality"))
     dr_col, dr_desc = _dr_assessment(report.dr_score)
@@ -843,10 +882,11 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     print(_subsection("Spectral Analysis  (numpy FFT engine)"))
     sp = auth.spectral
     if sp and sp.verdict_label != "INCONCLUSIVE":
-        conf_filled  = int(sp.confidence_pct / 10); conf_empty = 10 - conf_filled
+        conf_filled  = int(sp.net_confidence_pct / 10); conf_empty = 10 - conf_filled
         verdict_col  = {"GENUINE": C.GREEN, "LIKELY_GENUINE":C.GREEN, "CAUTION": C.YELLOW, "SUSPICIOUS": C.ORANGE, "LIKELY_LOSSY": C.RED}.get(sp.verdict_label, C.WHITE)
         conf_bar = _c(verdict_col, "█" * conf_filled) + _c(C.GREY, "░" * conf_empty)
         print(f"  {conf_bar} {_c(verdict_col + C.BOLD, sp.primary_verdict)}")
+        print(f"  {_c(C.GREY, f'Raw Error Rate: {sp.raw_lossy_pct:.1f}%  |  Net Verdict Certainty: {sp.net_confidence_pct:.1f}%')}")
         print(f"  {_c(C.GREY, f'Score: Lossy {sp.lossy_score} − Natural {sp.natural_score} = Net {sp.net_score}/{sp.max_score}')}")
         print()
         rows_spec = [
