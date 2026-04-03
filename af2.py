@@ -212,8 +212,8 @@ def extract_loudness(filepath: Path) -> LoudnessProfile:
 
     r2 = _run(["ffmpeg", "-i", str(filepath), "-vn", "-af", "aresample=48000,ebur128=peak=true", "-f", "null", "-"])
     def _field(pat: str) -> str:
-        m = re.search(pat, r2.stderr)
-        return m.group(1).strip() if m else ""
+        matches = re.findall(pat, r2.stderr)
+        return matches[-1].strip() if matches else ""
 
     lp.lufs_integrated = _field(r"I:\s*([-\d.]+)\s*LUFS")
     lp.lufs_range = _field(r"LRA:\s*([\d.]+)\s*LU")
@@ -338,7 +338,6 @@ def generate_spectrogram(filepath: Path) -> Path:
         decode_result = _run([
             "ffmpeg", "-y", "-i", str(filepath), "-vn",
             "-ac", "1",           # mix to mono
-            "-ar", "44100",       # standard SR for SoX
             "-sample_fmt", "s16", # 16-bit PCM
             str(tmp_mono)
         ])
@@ -495,10 +494,14 @@ class SpectralEngine:
         lo = max(0, hi - int(scan_hz / bin_hz))
         region = frames[:, lo:hi]  # shape: (n_frames, n_bins)
         if region.shape[1] < 4: return 0.0
-        # low temporal variance = unnaturally stable = banding
-        temporal_var = np.var(region, axis=0).mean()
-        # normalise — tune the divisor against known lossy/lossless pairs
-        return float(np.clip(1.0 - (temporal_var / 0.01), 0.0, 1.0))
+        
+        # Convert localized amplitudes to dB to evaluate temporal variance properly
+        ref = region.max() + 1e-12
+        db = 20.0 * np.log10(region / ref + 1e-12)
+        
+        # Normalise: steady tonal bands have temporal std < 5 dB. Organic music has > 15 dB
+        temporal_std = np.std(db, axis=0).mean()
+        return float(np.clip(1.0 - (temporal_std / 15.0), 0.0, 1.0))
 
     def _noise_floor_above_cutoff(self, frames: "np.ndarray", bins: "np.ndarray", cutoff_hz: float) -> float:
         above = frames[:, int(cutoff_hz / (bins[1] - bins[0])):]
@@ -587,23 +590,25 @@ class SpectralEngine:
         if dsd_detected:
             l_ev.append("Ultrasonic Noise Shaping: Massive high-frequency energy slope detected, highly indicative of a DSD/SACD transcode.")
         else:
-            if hf_ratio > 0.05:
+            # We explicitly gate Natural points behind the cutoff condition. Lossy codecs (like AAC) 
+            # can have high entropy and variance below their harsh cutoffs; we shouldn't reward it.
+            if hf_ratio > 0.05 and cutoff_hz > self.nyquist * 0.85:
                 n_score += self.NATURAL_RICH_HF
                 n_ev.append(f"Rich Harmonic Extension: Abundant high-frequency energy consistent with lossless preservation.")
             if nf_above > -50.0:
                 n_score += self.NATURAL_HF_NOISE
                 n_ev.append(f"Preserved Noise Floor: Presence of natural dither or analog hiss above the primary frequency ceiling.")
-            if entropy > 8.5:
+            if entropy > 8.5 and cutoff_hz > self.nyquist * 0.85:
                 n_score += self.NATURAL_HIGH_ENTROPY
                 n_ev.append(f"Spectral Complexity: High entropy score indicates dense, unpredictable signal data devoid of aggressive compression.")
 
         if sharpness < 5.0:
             n_score += self.NATURAL_GRADUAL_ROLLOFF
             n_ev.append(f"Organic Frequency Rolloff: Gradual attenuation consistent with natural acoustic decay or analog mastering.")
-        if variance > 100000 and not dsd_detected:
+        if variance > 100000 and not dsd_detected and cutoff_hz > self.nyquist * 0.85:
             n_score += self.NATURAL_HIGH_VARIANCE
             n_ev.append(f"Dynamic Cutoff Variance: Frequency ceiling fluctuates organically, typical of uncompressed analog-to-digital transfers.")
-        elif variance > 10000:
+        elif variance > 10000 and cutoff_hz > self.nyquist * 0.85:
             n_score += self.NATURAL_MODERATE_VARIANCE
             n_ev.append(f"Healthy Cutoff Variance: Frequency ceiling exhibits natural, subtle fluctuations.")
         if side_anomaly < 0.2:
