@@ -251,6 +251,9 @@ async def _run_cue_job(job: dict):
     prompt_msg_id  = data.get("prompt_msg_id")
     art_msg_id     = data.get("art_msg_id")
 
+    output_dir = os.path.join(work_dir, "split")
+    os.makedirs(output_dir, exist_ok=True)
+
     if not status_msg:
         logging.error("CUE missing dynamic status_msg element.")
         return
