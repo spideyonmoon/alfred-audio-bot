@@ -10,6 +10,7 @@ import os
 import re
 import time
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -70,7 +71,8 @@ app = Client(
 _start_time     = time.monotonic()
 _total_analyses = 0
 _analysis_queue: asyncio.Queue = asyncio.Queue()
-_active_users:   set[int]      = set()          # users currently queued or being processed
+_user_queue_counts: defaultdict[int, int] = defaultdict(int) 
+MAX_QUEUE_PER_USER = 5
 _current_job:    Optional[dict] = None           # {"user_id": int, "filename": str, "username": str}
 
 # ---------------------------------------------------------------------------
@@ -301,7 +303,9 @@ async def _queue_worker():
         except Exception:
             logger.exception("Queue worker: unhandled error in job")
         finally:
-            _active_users.discard(job["user_id"])
+            _user_queue_counts[job["user_id"]] -= 1
+            if _user_queue_counts[job["user_id"]] <= 0:
+                del _user_queue_counts[job["user_id"]]
             _current_job = None
             _analysis_queue.task_done()
 
@@ -528,14 +532,14 @@ async def forensic_command(client: Client, message: Message):
         return
 
     user_id = message.from_user.id
-    if user_id in _active_users:
-        await message.reply("⏳ You already have an analysis in the queue. Please wait.")
+    if _user_queue_counts[user_id] >= MAX_QUEUE_PER_USER:
+        await message.reply(f"⏳ **You have reached the maximum queue limit ({MAX_QUEUE_PER_USER}). Please wait for a slot.**")
         return
 
     args  = message.command[1:]
     flags = _parse_fs_flags(args)
 
-    _active_users.add(user_id)
+    _user_queue_counts[user_id] += 1
     job = {
         "client":   client,
         "message":  message,
@@ -625,4 +629,4 @@ if __name__ == "__main__":
             logger.error("Fatal startup error. Storing traceback to /tmp/crash.log and starting debug health server.")
             async def serve_crash():
                 await health.start_health_server(port=7860)
-            asyncio.run(serve_crash())
+            asyncio.run(serve_crash())# cache breaker 123
