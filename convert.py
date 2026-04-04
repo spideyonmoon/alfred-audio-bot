@@ -69,6 +69,12 @@ async def handle_convert_command(client: Client, message: Message):
         await message.reply("❌ The replied message doesn't contain an audio file.")
         return
 
+    filename = getattr(file_obj, "file_name", "").lower()
+    valid_exts = (".flac", ".alac", ".wav", ".aiff", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".dsf", ".dff")
+    if filename and not filename.endswith(valid_exts):
+        await message.reply("❌ Invalid format. Audio conversion can only process audio files.")
+        return
+
     args        = message.command[1:]
     target_fmt  = args[0].lower().strip() if args else ""
 
@@ -83,10 +89,11 @@ async def handle_convert_command(client: Client, message: Message):
     }
 
     if target_fmt in ("mp3", "flac", "alac", "aac", "ogg", "opus", "wav", "aiff"):
-        await _show_mode_menu(client, message, sess_key, target_fmt)
+        return await _show_mode_menu(client, message, sess_key, target_fmt)
     else:
         # No format given → show format picker
         await _show_format_menu(client, message, sess_key)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +174,18 @@ async def _show_mode_menu(client: Client, ctx, sess_key: str, fmt: str):
 
     else:
         # WAV, AIFF, ALAC — no sub-menu needed
-        await _start_conversion(client, ctx, sess_key, fmt, "pcm", "default")
-        return
+        session = _convert_sessions.pop(sess_key, None)
+        if not session: return None
+        return {
+            "type": "cnv",
+            "user_id": ctx.from_user.id,
+            "filename": getattr(session["file_obj"], "file_name", "unknown"),
+            "fmt": fmt,
+            "mode": "pcm",
+            "grade": "default",
+            "ctx": ctx,
+            "session": session
+        }
 
     text_fn = getattr(ctx, "reply", None) or getattr(ctx, "edit_message_text", None)
 
@@ -179,6 +196,7 @@ async def _show_mode_menu(client: Client, ctx, sess_key: str, fmt: str):
         # CallbackQuery — edit the existing message
         await ctx.edit_message_text(text, parse_mode=ParseMode.HTML,
                                     reply_markup=InlineKeyboardMarkup(rows))
+    return None
 
 
 async def _show_grade_menu(client: Client, query: CallbackQuery,
@@ -206,6 +224,7 @@ async def _show_grade_menu(client: Client, query: CallbackQuery,
 
     await query.edit_message_text(text, parse_mode=ParseMode.HTML,
                                   reply_markup=InlineKeyboardMarkup(rows))
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -235,17 +254,30 @@ async def handle_convert_callback(client: Client, query: CallbackQuery):
     # Route by depth
     if mode is None:
         # Format chosen → show mode/level menu
-        await _show_mode_menu(client, query, sess_key, fmt)
+        return await _show_mode_menu(client, query, sess_key, fmt)
 
     elif grade is None and fmt == "mp3" and mode in ("vbr", "cbr", "abr"):
         # MP3 mode chosen → show grade menu
-        await _show_grade_menu(client, query, sess_key, fmt, mode)
+        return await _show_grade_menu(client, query, sess_key, fmt, mode)
 
     else:
-        # All params collected → start conversion
+        # All params collected → return complete job payload for global scheduling
         effective_mode  = mode  or "default"
         effective_grade = grade or "default"
-        await _start_conversion(client, query, sess_key, fmt, effective_mode, effective_grade)
+        session = _convert_sessions.pop(sess_key, None)
+        if not session:
+            await query.answer("Session expired. Please run /cnv again.", show_alert=True)
+            return None
+        return {
+            "type": "cnv",
+            "user_id": user_id,
+            "filename": getattr(session["file_obj"], "file_name", "unknown"),
+            "fmt": fmt,
+            "mode": effective_mode,
+            "grade": effective_grade,
+            "ctx": query,
+            "session": session
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -256,23 +288,25 @@ _LOSSY_IN_LOSSLESS_WARNING = (
     "the file but does <b>not</b> recover lost audio data.</i>"
 )
 
-async def _start_conversion(client: Client, ctx, sess_key: str,
-                             fmt: str, mode: str, grade: str):
-    session   = _convert_sessions.pop(sess_key, None)
-    if not session:
-        return
+async def _run_convert_job(job: dict):
+    client    = job["client"]
+    ctx       = job["ctx"]
+    session   = job["session"]
+    fmt       = job["fmt"]
+    mode      = job["mode"]
+    grade     = job["grade"]
 
     source_msg = session["source_msg"]
     file_obj   = session["file_obj"]
     chat_id    = session["chat_id"]
     thread_id  = session["thread_id"]
+    status_msg = job["status_msg"]
+    
+    if not status_msg:
+        logger.error("Job provided no status_msg fallback framework!")
+        return
 
-    # Status message — edit existing or send new
-    status_text = "📥 <b>Downloading source file...</b>"
-    if isinstance(ctx, CallbackQuery):
-        status_msg = await ctx.edit_message_text(status_text, parse_mode=ParseMode.HTML)
-    else:
-        status_msg = await ctx.reply(status_text, parse_mode=ParseMode.HTML, quote=True)
+    await status_msg.edit_text("📥 <b>Downloading source file...</b>", parse_mode=ParseMode.HTML)
 
     tmp_dir     = tempfile.mkdtemp(prefix="alfred_cv_")
     src_path    = None
@@ -297,10 +331,14 @@ async def _start_conversion(client: Client, ctx, sess_key: str,
         src_is_lossy = src_suffix in _LOSSY_FORMATS
         tgt_is_lossless = fmt in ("flac", "alac", "wav", "aiff")
 
-        # Build FFmpeg command
+        # Build FFmpeg command. Protect against identical filesystem string overwritings by 
+        # injecting the output directly into a dedicated `/out/` child directory.
         out_ext, cmd_suffix, out_label = _build_ffmpeg_args(fmt, mode, grade)
         out_filename = f"{src_stem}.{out_ext}"
-        out_path     = os.path.join(tmp_dir, out_filename)
+        
+        out_dir = os.path.join(tmp_dir, "out")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, out_filename)
 
         ffmpeg_cmd = ["ffmpeg", "-y", "-i", src_path] + cmd_suffix + [out_path]
 

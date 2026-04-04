@@ -186,9 +186,18 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
                 
         state["cover_path"]  = local_art_path
         state["art_msg_id"]  = message.id
-
-        asyncio.create_task(_process_splitting(client, user_id))
-        return True
+        state["status"] = "processing"
+        
+        # Clean up wait status and dispatch the Job payload to bot.py
+        del CUE_WAITING_LIST[user_id]
+        
+        return {
+            "type": "cue",
+            "user_id": user_id,
+            "filename": "CUE Project",
+            "state": state,
+            "ctx": message
+        }
 
     return False
 
@@ -207,16 +216,30 @@ async def handle_cuesplit_callback(client: Client, query: CallbackQuery):
         return
 
     await query.answer()
-    CUE_WAITING_LIST[user_id]["cover_path"] = None
-    CUE_WAITING_LIST[user_id]["art_msg_id"] = None
-    asyncio.create_task(_process_splitting(client, user_id))
+    state = CUE_WAITING_LIST.pop(user_id)
+    state["cover_path"] = None
+    state["art_msg_id"] = None
+    state["status"]     = "processing"
+
+    return {
+        "type": "cue",
+        "user_id": user_id,
+        "filename": "CUE Project",
+        "state": state,
+        "ctx": query
+    }
 
 
 # ---------------------------------------------------------------------------
 # Core splitting pipeline
 # ---------------------------------------------------------------------------
-async def _process_splitting(client: Client, user_id: int):
-    data           = CUE_WAITING_LIST.pop(user_id)
+async def _run_cue_job(job: dict):
+    client         = job["client"]
+    ctx            = job["ctx"]
+    user_id        = job["user_id"]
+    data           = job["state"]
+    status_msg     = job["status_msg"]
+
     audio_msg      = data["audio_msg"]
     download_task  = data["download_task"]
     audio_path     = data["audio_path"]
@@ -228,10 +251,11 @@ async def _process_splitting(client: Client, user_id: int):
     prompt_msg_id  = data.get("prompt_msg_id")
     art_msg_id     = data.get("art_msg_id")
 
-    output_dir = os.path.join(work_dir, "split")
-    os.makedirs(output_dir, exist_ok=True)
+    if not status_msg:
+        logging.error("CUE missing dynamic status_msg element.")
+        return
 
-    status_msg     = None
+    await status_msg.edit_text("⚙️ <b>Processing CUE and Audio...</b>", parse_mode=ParseMode.HTML)
     local_thumb    = None
 
     try:

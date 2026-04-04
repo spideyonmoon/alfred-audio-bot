@@ -70,7 +70,7 @@ app = Client(
 # ---------------------------------------------------------------------------
 _start_time     = time.monotonic()
 _total_analyses = 0
-_analysis_queue: asyncio.Queue = asyncio.Queue()
+_task_queue: asyncio.Queue = asyncio.Queue()
 _user_queue_counts: defaultdict[int, int] = defaultdict(int) 
 MAX_QUEUE_PER_USER = 5
 _current_job:    Optional[dict] = None           # {"user_id": int, "filename": str, "username": str}
@@ -290,24 +290,66 @@ def make_telegraph_content(report: ForensicReport, include_assessment: bool = Tr
     return json.dumps(nodes, ensure_ascii=False)
 
 # ---------------------------------------------------------------------------
+# Universal Queue Dispatcher
+# ---------------------------------------------------------------------------
+async def enqueue_universal_task(job: dict, ctx):
+    user_id = job["user_id"]
+    if _user_queue_counts[user_id] >= MAX_QUEUE_PER_USER:
+        msg = f"⏳ **You have reached the maximum queue limit ({MAX_QUEUE_PER_USER}). Please wait for a slot.**"
+        if isinstance(ctx, CallbackQuery):
+            await ctx.edit_message_text(msg)
+        else:
+            await ctx.reply(msg, quote=True)
+        return
+
+    _user_queue_counts[user_id] += 1
+    
+    queue_pos = _task_queue.qsize()
+    if _current_job is not None:
+        text = f"✅ Queued. Position: <b>{queue_pos + 1}</b>."
+        if isinstance(ctx, CallbackQuery):
+            status_msg = await ctx.edit_message_text(text, parse_mode=ParseMode.HTML)
+        else:
+            status_msg = await ctx.reply(text, parse_mode=ParseMode.HTML, quote=True)
+    else:
+        text = "⏳ <b>Preparing task...</b>"
+        if isinstance(ctx, CallbackQuery):
+            status_msg = await ctx.edit_message_text(text, parse_mode=ParseMode.HTML)
+        else:
+            status_msg = await ctx.reply(text, parse_mode=ParseMode.HTML, quote=True)
+
+    job["status_msg"] = status_msg
+    job["client"] = getattr(ctx, "_client", app)
+    await _task_queue.put(job)
+
+# ---------------------------------------------------------------------------
 # Queue worker
 # ---------------------------------------------------------------------------
 async def _queue_worker():
     global _current_job, _total_analyses
     while True:
-        job = await _analysis_queue.get()
+        job = await _task_queue.get()
         _current_job = job
         try:
-            await _run_forensic_job(job)
+            job_type = job.get("type")
+            if job_type == "fs":
+                await _run_forensic_job(job["payload"])
+            elif job_type == "cnv":
+                import convert
+                await convert._run_convert_job(job)
+            elif job_type == "cue":
+                import cue_split
+                await cue_split._run_cue_job(job)
             _total_analyses += 1
         except Exception:
             logger.exception("Queue worker: unhandled error in job")
         finally:
-            _user_queue_counts[job["user_id"]] -= 1
-            if _user_queue_counts[job["user_id"]] <= 0:
-                del _user_queue_counts[job["user_id"]]
+            user_id = job["user_id"]
+            _user_queue_counts[user_id] -= 1
+            if _user_queue_counts[user_id] <= 0:
+                del _user_queue_counts[user_id]
             _current_job = None
-            _analysis_queue.task_done()
+            _task_queue.task_done()
 
 async def _run_forensic_job(job: dict):
     """Execute a single /fs analysis job from the queue."""
@@ -331,7 +373,12 @@ async def _run_forensic_job(job: dict):
         await message.reply(f"❌ File exceeds the MTProto limit of <b>{MAX_FILE_SIZE_MB} MB</b>.")
         return
 
-    status_msg = await message.reply("📥 <b>Downloading...</b>", quote=True)
+    status_msg = job.get("status_msg")
+    if status_msg:
+        await status_msg.edit_text("📥 <b>Downloading...</b>", parse_mode=ParseMode.HTML)
+    else:
+        status_msg = await message.reply("📥 <b>Downloading...</b>", quote=True)
+        
     file_path_str = None
     spec_path     = None
 
@@ -478,7 +525,7 @@ async def help_command(client: Client, message: Message):
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command("ping"))
 async def ping_command(client: Client, message: Message):
-    await message.reply("🏓 **PONG! Alfred V6 Layout Updates are LIVE!**")
+    await message.reply("🏓 **PONG! Alfred V7 Universal Scheduler is LIVE!**")
 
 # ---------------------------------------------------------------------------
 # /stats
@@ -490,7 +537,7 @@ async def stats_command(client: Client, message: Message):
     m, s       = divmod(rem, 60)
     uptime_str = f"{h}h {m}m {s}s"
 
-    queue_len  = _analysis_queue.qsize()
+    queue_len  = _task_queue.qsize()
     if _current_job:
         active_str = f"Analysing <b>{_current_job['filename']}</b> for @{_current_job.get('username', '?')}"
     else:
@@ -538,30 +585,31 @@ async def forensic_command(client: Client, message: Message):
         await message.reply("❌ The replied message does not contain an audio file.")
         return
 
-    user_id = message.from_user.id
-    if _user_queue_counts[user_id] >= MAX_QUEUE_PER_USER:
-        await message.reply(f"⏳ **You have reached the maximum queue limit ({MAX_QUEUE_PER_USER}). Please wait for a slot.**")
+    filename = getattr(file_obj, "file_name", "").lower()
+    valid_exts = (".flac", ".alac", ".wav", ".aiff", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".dsf", ".dff")
+    if filename and not filename.endswith(valid_exts):
+        await message.reply("❌ Invalid format. Audio forensics can only process audio files.")
         return
 
     args  = message.command[1:]
     flags = _parse_fs_flags(args)
 
-    _user_queue_counts[user_id] += 1
     job = {
-        "client":   client,
-        "message":  message,
-        "replied":  replied,
-        "file_obj": file_obj,
-        "flags":    flags,
-        "user_id":  user_id,
-        "username": message.from_user.username or message.from_user.first_name,
-        "filename": getattr(file_obj, "file_name", "unknown"),
+        "type": "fs",
+        "user_id": user_id,
+        "filename": filename,
+        "payload": {
+            "client":   client,
+            "message":  message,
+            "replied":  replied,
+            "file_obj": file_obj,
+            "flags":    flags,
+            "user_id":  user_id,
+            "username": message.from_user.username or message.from_user.first_name,
+            "filename": filename,
+        }
     }
-    await _analysis_queue.put(job)
-    
-    queue_pos = _analysis_queue.qsize()
-    if _current_job is not None:
-        await message.reply(f"✅ Queued. Position: <b>{queue_pos}</b>.", quote=True)
+    await enqueue_universal_task(job, message)
 
 # ---------------------------------------------------------------------------
 # /cue — CUE splitting (Pyrogram-native, wired from cue_split.py)
@@ -576,11 +624,15 @@ async def cuesplit_command(client: Client, message: Message):
 @app.on_message(filters.document | filters.photo)
 async def cue_interceptor(client: Client, message: Message):
     """Intercept document/photo messages for CUE state machine."""
-    await cue_split.check_and_process_cue_upload(client, message)
+    job = await cue_split.check_and_process_cue_upload(client, message)
+    if isinstance(job, dict):
+        await enqueue_universal_task(job, message)
 
 @app.on_callback_query(filters.regex(r"^cuesplit_"))
 async def cuesplit_callback(client: Client, query: CallbackQuery):
-    await cue_split.handle_cuesplit_callback(client, query)
+    job = await cue_split.handle_cuesplit_callback(client, query)
+    if isinstance(job, dict):
+        await enqueue_universal_task(job, query)
 
 # ---------------------------------------------------------------------------
 # /cnv — audio conversion
@@ -590,11 +642,15 @@ async def convert_command(client: Client, message: Message):
     if not _check_auth(message):
         await _reject_auth(message)
         return
-    await convert.handle_convert_command(client, message)
+    job = await convert.handle_convert_command(client, message)
+    if isinstance(job, dict):
+        await enqueue_universal_task(job, message)
 
 @app.on_callback_query(filters.regex(r"^cv:"))
 async def convert_callback(client: Client, query: CallbackQuery):
-    await convert.handle_convert_callback(client, query)
+    job = await convert.handle_convert_callback(client, query)
+    if isinstance(job, dict):
+        await enqueue_universal_task(job, query)
 
 # ---------------------------------------------------------------------------
 # Entry point
