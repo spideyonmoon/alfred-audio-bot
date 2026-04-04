@@ -474,6 +474,13 @@ async def help_command(client: Client, message: Message):
     await message.reply(text)
 
 # ---------------------------------------------------------------------------
+# /ping - Diagnostic
+# ---------------------------------------------------------------------------
+@app.on_message(filters.command("ping"))
+async def ping_command(client: Client, message: Message):
+    await message.reply("🏓 **PONG! Alfred V5 Queue Fix is LIVE!**")
+
+# ---------------------------------------------------------------------------
 # /stats
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command("stats"))
