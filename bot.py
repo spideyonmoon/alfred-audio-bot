@@ -669,10 +669,12 @@ async def forensic_command(client: Client, message: Message):
         await message.reply("❌ The replied message does not contain an audio file.")
         return
 
+    filename = getattr(file_obj, "file_name", "Unknown Audio") or "Unknown Audio"
+    filename = filename.lower()
+
     if replied.document:
-        filename = getattr(file_obj, "file_name", "").lower()
         valid_exts = (".flac", ".alac", ".wav", ".aiff", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".dsf", ".dff")
-        if filename and not filename.endswith(valid_exts):
+        if filename != "unknown audio" and not filename.endswith(valid_exts):
             await message.reply("❌ Invalid format. Audio forensics can only process audio files.")
             return
 
