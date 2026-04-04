@@ -558,9 +558,9 @@ async def forensic_command(client: Client, message: Message):
         "filename": getattr(file_obj, "file_name", "unknown"),
     }
     await _analysis_queue.put(job)
-
+    
     queue_pos = _analysis_queue.qsize()
-    if queue_pos > 1:
+    if _current_job is not None:
         await message.reply(f"✅ Queued. Position: <b>{queue_pos}</b>.", quote=True)
 
 # ---------------------------------------------------------------------------
