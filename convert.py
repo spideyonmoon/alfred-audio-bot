@@ -69,11 +69,12 @@ async def handle_convert_command(client: Client, message: Message):
         await message.reply("❌ The replied message doesn't contain an audio file.")
         return
 
-    filename = getattr(file_obj, "file_name", "").lower()
-    valid_exts = (".flac", ".alac", ".wav", ".aiff", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".dsf", ".dff")
-    if filename and not filename.endswith(valid_exts):
-        await message.reply("❌ Invalid format. Audio conversion can only process audio files.")
-        return
+    if replied.document:
+        filename = getattr(file_obj, "file_name", "").lower()
+        valid_exts = (".flac", ".alac", ".wav", ".aiff", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".dsf", ".dff")
+        if filename and not filename.endswith(valid_exts):
+            await message.reply("❌ Invalid format. Audio conversion can only process audio files.")
+            return
 
     args        = message.command[1:]
     target_fmt  = args[0].lower().strip() if args else ""
