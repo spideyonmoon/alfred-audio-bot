@@ -55,16 +55,24 @@ CUE_WAITING_LIST: dict[int, dict] = {}
 async def handle_cuesplit_command(client: Client, message: Message):
     """Triggered by /cue. Must be a reply to an audio/document."""
     user_id = message.from_user.id
-
     if not message.reply_to_message:
         await message.reply("❌ <b>Reply to an audio file</b> with this command.", parse_mode=ParseMode.HTML)
         return
 
     target = message.reply_to_message
-    if not (target.audio or target.document):
+    file_obj = target.audio or target.document or target.voice
+    if not file_obj:
         await message.reply("❌ The replied message does not contain an audio file.")
         return
 
+    if target.document:
+        filename = getattr(file_obj, "file_name", "").lower()
+        valid_exts = (".flac", ".alac", ".wav", ".aiff", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".dsf", ".dff")
+        if filename and not filename.endswith(valid_exts):
+            await message.reply("❌ Invalid format. Audio splitting can only process audio files.")
+            return
+
+    user_id = message.from_user.id
     if user_id in CUE_WAITING_LIST:
         await message.reply("⏳ You already have an active CUE session. Please finish or restart.")
         return
