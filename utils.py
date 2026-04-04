@@ -59,16 +59,18 @@ async def progress_callback(
     
     # Intercept telemetry values globally if a job_id context exists
     try:
-        from bot import _active_jobs
-        if job_id and job_id in _active_jobs:
-            job_state = _active_jobs[job_id]
-            job_state["progress"] = percent
-            job_state["speed"] = speed_str
-            job_state["eta"] = eta_str
-            job_state["downloaded"] = curr_str
-            job_state["total"] = tot_str
-            job_state["status"] = f"{prefix}"
-    except ImportError:
+        import sys
+        if "bot" in sys.modules:
+            _active_jobs = sys.modules["bot"]._active_jobs
+            if job_id and job_id in _active_jobs:
+                job_state = _active_jobs[job_id]
+                job_state["progress"] = percent
+                job_state["speed"] = speed_str
+                job_state["eta"] = eta_str
+                job_state["downloaded"] = curr_str
+                job_state["total"] = tot_str
+                job_state["status"] = f"{prefix}"
+    except Exception:
         pass
     
     text = (

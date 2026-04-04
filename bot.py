@@ -445,7 +445,9 @@ async def _run_forensic_job(job: dict):
         logger.info("Analysis start | user=%s chat=%d file=%s flags=%s", username, chat_id, filename, flags)
 
         # Spec-only: just generate and send the spectrogram, done
+        job_id = job.get("job_id")
         if want_spec and not want_info:
+            if job_id and job_id in _active_jobs: _active_jobs[job_id]["status"] = "Generating spectrogram..."
             await status_msg.edit_text("📊 <b>Generating spectrogram...</b>")
             spec_path = await asyncio.wait_for(
                 asyncio.to_thread(generate_spectrogram, temp_path),
@@ -463,6 +465,7 @@ async def _run_forensic_job(job: dict):
             return
 
         # Full/partial analysis
+        if job_id and job_id in _active_jobs: _active_jobs[job_id]["status"] = "Analysing..."
         await status_msg.edit_text("🔬 <b>Analysing...</b>")
         report = await asyncio.wait_for(
             asyncio.to_thread(build_report, temp_path),
@@ -486,6 +489,7 @@ async def _run_forensic_job(job: dict):
 
         page_url = None
         if want_info:
+            if job_id and job_id in _active_jobs: _active_jobs[job_id]["status"] = "Uploading to Telegraph..."
             await status_msg.edit_text("🌐 <b>Uploading to Telegraph...</b>")
             content  = make_telegraph_content(report, include_assessment=want_assessment)
             title_fmt = f"Analysis on {filename}"
