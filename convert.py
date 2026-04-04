@@ -98,12 +98,16 @@ async def _show_format_menu(client: Client, message: Message, sess_key: str):
         [
             InlineKeyboardButton("FLAC",  callback_data=f"cv:{chat_id}:{src_id}:flac"),
             InlineKeyboardButton("ALAC",  callback_data=f"cv:{chat_id}:{src_id}:alac"),
+        ],
+        [
             InlineKeyboardButton("WAV",   callback_data=f"cv:{chat_id}:{src_id}:wav"),
             InlineKeyboardButton("AIFF",  callback_data=f"cv:{chat_id}:{src_id}:aiff"),
         ],
         [
             InlineKeyboardButton("MP3",   callback_data=f"cv:{chat_id}:{src_id}:mp3"),
             InlineKeyboardButton("AAC",   callback_data=f"cv:{chat_id}:{src_id}:aac"),
+        ],
+        [
             InlineKeyboardButton("OGG",   callback_data=f"cv:{chat_id}:{src_id}:ogg"),
             InlineKeyboardButton("Opus",  callback_data=f"cv:{chat_id}:{src_id}:opus"),
         ],
@@ -125,29 +129,40 @@ async def _show_mode_menu(client: Client, ctx, sess_key: str, fmt: str):
         return InlineKeyboardButton(label, callback_data=f"cv:{chat_id}:{src_id}:{fmt}:{mode}")
 
     if fmt == "mp3":
-        rows = [[btn("VBR", "vbr"), btn("CBR", "cbr"), btn("ABR", "abr")]]
+        rows = [
+            [btn("VBR", "vbr"), btn("CBR", "cbr")],
+            [btn("ABR", "abr")]
+        ]
         text = "🎵 <b>MP3 encoding mode?</b>"
 
     elif fmt in ("flac", "alac"):
-        rows = [[btn("Level 0  (fastest)", "0"),
-                 btn("Level 5  (default)", "5"),
-                 btn("Level 8  (smallest)", "8")]]
+        rows = [
+            [btn("Level 0 (fastest)", "0")],
+            [btn("Level 5 (default)", "5")],
+            [btn("Level 8 (smallest)", "8")]
+        ]
         text = f"🎵 <b>{fmt.upper()} compression level?</b>"
 
     elif fmt == "aac":
-        rows = [[btn("128k", "128"), btn("192k", "192"),
-                 btn("256k", "256"), btn("320k", "320")]]
+        rows = [
+            [btn("128k", "128"), btn("192k", "192")],
+            [btn("256k", "256"), btn("320k", "320")]
+        ]
         text = "🎵 <b>AAC bitrate?</b>"
 
     elif fmt == "ogg":
-        rows = [[btn("Q3 (~112k)", "3"), btn("Q5 (~160k)", "5"),
-                 btn("Q7 (~224k)", "7"), btn("Q9 (~320k)", "9")]]
+        rows = [
+            [btn("Q3 (~112k)", "3"), btn("Q5 (~160k)", "5")],
+            [btn("Q7 (~224k)", "7"), btn("Q9 (~320k)", "9")]
+        ]
         text = "🎵 <b>OGG Vorbis quality?</b>"
 
     elif fmt == "opus":
-        rows = [[btn("64k",  "64"),  btn("96k",  "96"),
-                 btn("128k", "128"), btn("192k", "192"),
-                 btn("256k", "256")]]
+        rows = [
+            [btn("64k", "64"), btn("96k", "96")],
+            [btn("128k", "128"), btn("192k", "192")],
+            [btn("256k", "256")]
+        ]
         text = "🎵 <b>Opus bitrate?</b>"
 
     else:
@@ -175,13 +190,18 @@ async def _show_grade_menu(client: Client, query: CallbackQuery,
         return InlineKeyboardButton(label, callback_data=f"cv:{chat_id}:{src_id}:{fmt}:{mode}:{grade}")
 
     if mode == "vbr":
-        rows = [[btn("V0 (best)", "0"), btn("V1", "1"), btn("V2", "2"),
-                 btn("V3", "3"), btn("V4", "4")]]
+        rows = [
+            [btn("V0 (best)", "0"), btn("V1", "1")],
+            [btn("V2", "2"), btn("V3", "3")],
+            [btn("V4", "4")]
+        ]
         text = "🎵 <b>MP3 VBR quality?</b>\n<i>V0 ≈ 245 kbps avg — highest quality</i>"
     else:
         # CBR / ABR
-        rows = [[btn("128k", "128"), btn("192k", "192"),
-                 btn("256k", "256"), btn("320k", "320")]]
+        rows = [
+            [btn("128k", "128"), btn("192k", "192")],
+            [btn("256k", "256"), btn("320k", "320")]
+        ]
         text = f"🎵 <b>MP3 {mode.upper()} bitrate?</b>"
 
     await query.edit_message_text(text, parse_mode=ParseMode.HTML,

@@ -478,7 +478,7 @@ async def help_command(client: Client, message: Message):
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command("ping"))
 async def ping_command(client: Client, message: Message):
-    await message.reply("🏓 **PONG! Alfred V5 Queue Fix is LIVE!**")
+    await message.reply("🏓 **PONG! Alfred V6 Layout Updates are LIVE!**")
 
 # ---------------------------------------------------------------------------
 # /stats
