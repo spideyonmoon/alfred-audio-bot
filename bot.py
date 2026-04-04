@@ -588,10 +588,6 @@ async def stats_command(client: Client, message: Message):
     h, rem     = divmod(uptime_sec, 3600)
     m, s       = divmod(rem, 60)
     
-    cpu_usage = psutil.cpu_percent() if psutil else 0.0
-    mem_usage = psutil.virtual_memory().percent if psutil else 0.0
-    disk_usage = psutil.disk_usage('/').free / (1024**3) if psutil else 0.0
-    
     out = []
     for jid, st in _active_jobs.items():
         if not st.get("async_task"): continue
@@ -617,15 +613,7 @@ async def stats_command(client: Client, message: Message):
         out.append(block)
     
     jobs_str = "\n".join(out) if out else "<i>No active tasks.</i>\n"
-    
-    sys_text = (
-        f"⌬ <b>𝗕𝗢𝗧 𝗦𝗧𝗔𝗧𝗦</b>\n"
-        f"╭ CPU  : {cpu_usage}%\n"
-        f"┊ RAM  : {mem_usage}%\n"
-        f"┊ FREE : {disk_usage:.2f}GB\n"
-        f"╰ UP   : {h}h{m}m{s}s\n"
-    )
-    await message.reply(f"{jobs_str}\n{sys_text}")
+    await message.reply(f"{jobs_str}")
 
 @app.on_message(filters.regex(r"^/c_(.+)$") | filters.regex(r"^/cancel_(.+)$"))
 async def cancel_command(client: Client, message: Message):
@@ -670,6 +658,7 @@ async def forensic_command(client: Client, message: Message):
         await _reject_auth(message)
         return
 
+    user_id = message.from_user.id
     replied = message.reply_to_message
     if not replied:
         await message.reply("↩️ <i>Reply to an audio file with <code>/fs</code> [flag].</i>")
