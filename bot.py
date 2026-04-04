@@ -568,11 +568,11 @@ async def help_command(client: Client, message: Message):
     await message.reply(text)
 
 # ---------------------------------------------------------------------------
-# /ping - Diagnostic
+# /pong - Diagnostic
 # ---------------------------------------------------------------------------
-@app.on_message(filters.command("ping"))
-async def ping_command(client: Client, message: Message):
-    await message.reply("🏓 **PONG! Alfred V7 Universal Scheduler is LIVE!**")
+@app.on_message(filters.command("pong"))
+async def pong_command(client: Client, message: Message):
+    await message.reply("🏓 **PING! Alfred V3.5 Universal Scheduler is LIVE!**")
 
 # ---------------------------------------------------------------------------
 # /stats
