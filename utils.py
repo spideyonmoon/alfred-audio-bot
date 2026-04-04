@@ -4,56 +4,100 @@ from typing import Optional
 from pyrogram.types import Message
 from pyrogram.errors import MessageNotModified, FloodWait
 import asyncio
+from pyrogram.enums import ParseMode
+
+def time_formatter(seconds: float) -> str:
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    tmp = ((str(days) + "d ") if days else "") + \
+        ((str(hours) + "h ") if hours else "") + \
+        ((str(minutes) + "m ") if minutes else "") + \
+        ((str(seconds) + "s") if seconds else "")
+    return tmp if tmp else "0s"
+
+def humanbytes(size: float) -> str:
+    if not size:
+        return "0 B"
+    power = 2**10
+    n = 0
+    Dic_powerN = {0: ' ', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+    while size > power:
+        size /= power
+        n += 1
+    return f"{str(round(size, 2))} {Dic_powerN[n]}B"
 
 async def progress_callback(
     current: int,
     total: int,
-    message: Message,
-    action_text: str,
+    status_msg: Message,
+    prefix: str,
     start_time: float,
-    last_edit_time: list[float]
+    last_update: list[float],
+    job_id: str = None
 ):
     """
-    A progress callback for Pyrogram's upload/download methods.
-    Rate-limits message edits to avoid FloodWaits.
+    Standard Pyrogram download/upload progress tracker with injected 
+    telemetry mapping to support WZML-style global queues.
     """
     now = time.time()
-    # Edit at most once every 1.5 seconds, or when we hit 100%
-    if now - last_edit_time[0] < 1.5 and current < total:
+    
+    # Throttle API edit requests to every 3 seconds to avoid FloodWait
+    if now - last_update[0] < 3.0 and current < total:
         return
-
-    last_edit_time[0] = now
+        
+    last_update[0] = now
     
-    # Handle unknown total sizes
-    if total == 0:
-        total = current + 1 
+    percent = (current / total) * 100 if total > 0 else 0
+    speed   = current / (now - start_time) if now > start_time else 0
+    eta     = (total - current) / speed if speed > 0 else 0
 
-    percent = current * 100 / total
-    elapsed = now - start_time
-    speed = current / elapsed if elapsed > 0 else 0
+    speed_str = humanbytes(speed) + "/s"
+    eta_str   = time_formatter(eta)
+    curr_str  = humanbytes(current)
+    tot_str   = humanbytes(total)
     
-    # Build progress bar UI [██████░░░░]
-    filled_blocks = int(math.floor((percent / 100.0) * 10))
-    empty_blocks = 10 - filled_blocks
-    bar = "█" * filled_blocks + "░" * empty_blocks
-
-    # Convert bytes to MB
-    current_mb = current / (1024 * 1024)
-    total_mb = total / (1024 * 1024)
-    speed_mb = speed / (1024 * 1024)
-
-    text = (
-        f"⏳ <b>{action_text}</b>\n\n"
-        f"<code>{bar}</code> {percent:.1f}%\n"
-        f"<b>{current_mb:.1f} MB</b> of <b>{total_mb:.1f} MB</b>\n"
-        f"🚀 <b>{speed_mb:.1f} MB/s</b>"
-    )
-
+    # Intercept telemetry values globally if a job_id context exists
     try:
-        await message.edit_text(text, parse_mode=message.client.parse_mode)
-    except MessageNotModified:
+        from bot import _active_jobs
+        if job_id and job_id in _active_jobs:
+            job_state = _active_jobs[job_id]
+            job_state["progress"] = percent
+            job_state["speed"] = speed_str
+            job_state["eta"] = eta_str
+            job_state["downloaded"] = curr_str
+            job_state["total"] = tot_str
+            job_state["status"] = f"{prefix}"
+    except ImportError:
         pass
-    except FloodWait as e:
-        last_edit_time[0] += e.value  # Sleep implicitly by delaying next edit limit
+    
+    text = (
+        f"<b>{prefix}</b>\n"
+        f"┠ <b>Progress:</b> <code>{percent:.1f}%</code>\n"
+        f"┠ <b>Size:</b> <code>{curr_str} / {tot_str}</code>\n"
+        f"┠ <b>Speed:</b> <code>{speed_str}</code>\n"
+        f"┖ <b>ETA:</b> <code>{eta_str}</code>"
+    )
+    
+    try:
+        await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
     except Exception:
         pass
+
+async def run_async_subprocess(cmd: list) -> tuple[int, str]:
+    """
+    Native asynchronous subprocess dispatcher designed specifically to pass 
+    `CancelledError` exceptions into the internal child processes, forcing
+    abort termination against FFmpeg and SoX OS threads reliably.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        stdout, stderr = await proc.communicate()
+        return proc.returncode, stderr.decode(errors="replace")
+    except asyncio.CancelledError:
+        proc.kill()
+        raise

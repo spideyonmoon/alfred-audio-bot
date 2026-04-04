@@ -25,7 +25,7 @@ from pyrogram.types import (
 )
 from pyrogram.enums import ParseMode
 
-from utils import progress_callback
+from utils import progress_callback, run_async_subprocess
 
 try:
     from mutagen import File as MutagenFile
@@ -321,7 +321,7 @@ async def _run_convert_job(job: dict):
             message=source_msg, 
             file_name=tmp_dir + "/",
             progress=progress_callback,
-            progress_args=(status_msg, "Downloading Source", start_time, [0.0])
+            progress_args=(status_msg, "Downloading Source", start_time, [0.0], job.get("job_id"))
         )
         if not src_path or not os.path.exists(src_path):
             await status_msg.edit_text("❌ Download failed.")
@@ -348,8 +348,8 @@ async def _run_convert_job(job: dict):
             parse_mode=ParseMode.HTML
         )
 
-        proc, stderr = await asyncio.to_thread(_run_ffmpeg, ffmpeg_cmd)
-        if proc != 0 or not os.path.exists(out_path):
+        retcode, stderr = await run_async_subprocess(ffmpeg_cmd)
+        if retcode != 0 or not os.path.exists(out_path):
             error_trace = f"\n<pre>{stderr[-500:]}</pre>" if stderr else ""
             await status_msg.edit_text(f"❌ Conversion failed. FFmpeg returned an error:{error_trace}", parse_mode=ParseMode.HTML)
             return
@@ -385,7 +385,7 @@ async def _run_convert_job(job: dict):
             message_thread_id   = thread_id,
             reply_to_message_id = source_msg.id,
             progress            = progress_callback,
-            progress_args       = (status_msg, "Uploading Converted File", time.time(), [0.0])
+            progress_args       = (status_msg, "Uploading Converted File", time.time(), [0.0], job.get("job_id"))
         )
         await status_msg.delete()
 
@@ -400,11 +400,7 @@ async def _run_convert_job(job: dict):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _run_ffmpeg(cmd: list) -> tuple[int, str]:
-    """Blocking FFmpeg call (run in thread). Returns (returncode, stderr)."""
-    import subprocess
-    result = subprocess.run(cmd, capture_output=True)
-    return result.returncode, result.stderr.decode(errors="replace")
+
 
 
 def _build_ffmpeg_args(fmt: str, mode: str, grade: str) -> tuple[str, list, str]:

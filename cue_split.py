@@ -28,6 +28,8 @@ from pyrogram.types import (
 )
 from pyrogram.enums import ParseMode
 
+from utils import run_async_subprocess
+
 # Mutagen for tagging
 try:
     from mutagen.flac import FLAC, Picture
@@ -344,14 +346,13 @@ async def _run_cue_job(job: dict):
                 cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
             cmd += ["-map_metadata", "-1", out_file]
 
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            await proc.wait()
+            try:
+                retcode, stderr = await run_async_subprocess(cmd)
+            except Exception as e:
+                logger.warning("CUE FFmpeg subprocess fault: %r", e)
+                retcode = 1
 
-            if proc.returncode == 0:
+            if retcode == 0:
                 tag_data = {
                     "title":        title,
                     "artist":       track.get("performer", global_meta.get("album_artist", "")),

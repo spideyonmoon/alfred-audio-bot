@@ -10,9 +10,15 @@ import os
 import re
 import time
 import tempfile
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 from dotenv import load_dotenv
 import httpx
@@ -73,7 +79,8 @@ _total_analyses = 0
 _task_queue: asyncio.Queue = asyncio.Queue()
 _user_queue_counts: defaultdict[int, int] = defaultdict(int) 
 MAX_QUEUE_PER_USER = 5
-_current_job:    Optional[dict] = None           # {"user_id": int, "filename": str, "username": str}
+MAX_CONCURRENT_JOBS = 4
+_active_jobs: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Auth helper
@@ -304,19 +311,33 @@ async def enqueue_universal_task(job: dict, ctx):
 
     _user_queue_counts[user_id] += 1
     
+    job_id = uuid.uuid4().hex[:6]
+    job["job_id"] = job_id
+    
+    username = getattr(ctx.from_user, "username", None) or getattr(ctx.from_user, "first_name", "Unknown")
+    _active_jobs[job_id] = {
+        "job_id": job_id,
+        "user_id": user_id,
+        "username": username,
+        "type": job.get("type", "unknown").upper(),
+        "filename": job.get("filename", "Unknown Audio"),
+        "status": "Queued",
+        "progress": 0.0,
+        "speed": "0 B/s",
+        "eta": "-",
+        "downloaded": "0 B",
+        "total": "0 B",
+        "start_time": 0.0,
+        "async_task": None
+    }
+    
     queue_pos = _task_queue.qsize()
-    if _current_job is not None:
-        text = f"✅ Queued. Position: <b>{queue_pos + 1}</b>."
-        if isinstance(ctx, CallbackQuery):
-            status_msg = await ctx.edit_message_text(text, parse_mode=ParseMode.HTML)
-        else:
-            status_msg = await ctx.reply(text, parse_mode=ParseMode.HTML, quote=True)
+    text = f"✅ Queued. Position: <b>{queue_pos + 1}</b>.\n⋗ Stop: /c_{job_id}"
+    
+    if isinstance(ctx, CallbackQuery):
+        status_msg = await ctx.edit_message_text(text, parse_mode=ParseMode.HTML)
     else:
-        text = "⏳ <b>Preparing task...</b>"
-        if isinstance(ctx, CallbackQuery):
-            status_msg = await ctx.edit_message_text(text, parse_mode=ParseMode.HTML)
-        else:
-            status_msg = await ctx.reply(text, parse_mode=ParseMode.HTML, quote=True)
+        status_msg = await ctx.reply(text, parse_mode=ParseMode.HTML, quote=True)
 
     job["status_msg"] = status_msg
     job["client"] = getattr(ctx, "_client", app)
@@ -326,30 +347,56 @@ async def enqueue_universal_task(job: dict, ctx):
 # Queue worker
 # ---------------------------------------------------------------------------
 async def _queue_worker():
-    global _current_job, _total_analyses
+    global _total_analyses
     while True:
         job = await _task_queue.get()
-        _current_job = job
-        try:
-            job_type = job.get("type")
-            if job_type == "fs":
-                await _run_forensic_job(job["payload"])
-            elif job_type == "cnv":
-                import convert
-                await convert._run_convert_job(job)
-            elif job_type == "cue":
-                import cue_split
-                await cue_split._run_cue_job(job)
-            _total_analyses += 1
-        except Exception:
-            logger.exception("Queue worker: unhandled error in job")
-        finally:
-            user_id = job["user_id"]
-            _user_queue_counts[user_id] -= 1
-            if _user_queue_counts[user_id] <= 0:
-                del _user_queue_counts[user_id]
-            _current_job = None
+        job_id = job["job_id"]
+        
+        # Fast exit if cancelled during wait time
+        if job_id not in _active_jobs or _active_jobs[job_id]["status"] == "Cancelled":
+            _user_queue_counts[job["user_id"]] -= 1
+            if _user_queue_counts[job["user_id"]] <= 0:
+                del _user_queue_counts[job["user_id"]]
             _task_queue.task_done()
+            continue
+            
+        _active_jobs[job_id]["status"] = "Preparing..."
+        _active_jobs[job_id]["start_time"] = time.time()
+        
+        run_task = None
+        job_type = job.get("type")
+        
+        if job_type == "fs":
+            job["payload"]["job_id"] = job_id
+            run_task = asyncio.create_task(_run_forensic_job(job["payload"]))
+        elif job_type == "cnv":
+            import convert
+            run_task = asyncio.create_task(convert._run_convert_job(job))
+        elif job_type == "cue":
+            import cue_split
+            run_task = asyncio.create_task(cue_split._run_cue_job(job))
+            
+        if run_task:
+            _active_jobs[job_id]["async_task"] = run_task
+            try:
+                await run_task
+                _total_analyses += 1
+            except asyncio.CancelledError:
+                logger.info(f"Task {job_id} natively aborted.")
+                try:
+                    await job["status_msg"].edit_text(f"🛑 <b>Task Cancelled.</b> <code>{job_id}</code>", parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+            except Exception:
+                logger.exception("Queue worker: unhandled error in job")
+        
+        user_id = job["user_id"]
+        _user_queue_counts[user_id] -= 1
+        if _user_queue_counts[user_id] <= 0:
+            del _user_queue_counts[user_id]
+        
+        _active_jobs.pop(job_id, None)
+        _task_queue.task_done()
 
 async def _run_forensic_job(job: dict):
     """Execute a single /fs analysis job from the queue."""
@@ -388,7 +435,7 @@ async def _run_forensic_job(job: dict):
             message=replied,
             file_name="/tmp/downloads/",
             progress=progress_callback,
-            progress_args=(status_msg, "Downloading Audio", start_time, [0.0])
+            progress_args=(status_msg, "Downloading Audio", start_time, [0.0], job.get("job_id"))
         )
         if not file_path_str:
             raise ValueError("Download yielded an empty path.")
@@ -464,7 +511,7 @@ async def _run_forensic_job(job: dict):
                 file_name=f"{Path(filename).stem}_spectrogram.png",
                 caption=caption_text if want_info else f"<b>Spectrogram</b> — {filename}",
                 progress=progress_callback,
-                progress_args=(status_msg, "Uploading Spectrogram", time.time(), [0.0])
+                progress_args=(status_msg, "Uploading Spectrogram", time.time(), [0.0], job.get("job_id"))
             )
             await status_msg.delete()
         elif want_info:
@@ -530,27 +577,75 @@ async def ping_command(client: Client, message: Message):
 # ---------------------------------------------------------------------------
 # /stats
 # ---------------------------------------------------------------------------
+def _build_progress_bar(percent: float, length: int = 15) -> str:
+    filled = int(round((percent / 100.0) * length))
+    empty = length - filled
+    return "⬤" * filled + "○" * empty
+
 @app.on_message(filters.command("stats"))
 async def stats_command(client: Client, message: Message):
     uptime_sec = int(time.monotonic() - _start_time)
     h, rem     = divmod(uptime_sec, 3600)
     m, s       = divmod(rem, 60)
-    uptime_str = f"{h}h {m}m {s}s"
-
-    queue_len  = _task_queue.qsize()
-    if _current_job:
-        active_str = f"Analysing <b>{_current_job['filename']}</b> for @{_current_job.get('username', '?')}"
-    else:
-        active_str = "Idle"
-
-    text = (
-        f"<b>Alfred — Status</b>\n\n"
-        f"⏱ Uptime: <code>{uptime_str}</code>\n"
-        f"📊 Total analyses: <code>{_total_analyses}</code>\n"
-        f"📋 Queue: <code>{queue_len}</code> pending\n"
-        f"⚙️ Active: {active_str}\n"
+    
+    cpu_usage = psutil.cpu_percent() if psutil else 0.0
+    mem_usage = psutil.virtual_memory().percent if psutil else 0.0
+    disk_usage = psutil.disk_usage('/').free / (1024**3) if psutil else 0.0
+    
+    out = []
+    for jid, st in _active_jobs.items():
+        if not st.get("async_task"): continue
+        pct = st["progress"]
+        bar = _build_progress_bar(pct)
+        passed = int(time.time() - st["start_time"])
+        pm, ps = divmod(passed, 60)
+        ph, pm = divmod(pm, 60)
+        past_str = f"{ph}h{pm}m{ps}s" if ph else f"{pm}m{ps}s"
+        
+        block = (
+            f"╭ <b>Task By {st['username']}</b>\n"
+            f"┊ [{bar}] {pct:.1f}%\n"
+            f"┊ Status   : {st['status']}\n"
+            f"┊ Done     : {st['downloaded']}\n"
+            f"┊ Total    : {st['total']}\n"
+            f"┊ Speed    : {st['speed']}\n"
+            f"┊ ETA      : {st['eta']}\n"
+            f"┊ Past     : {past_str}\n"
+            f"╰ Mode     : #{st['type']}\n"
+            f"⋗ Stop : /c_{jid}\n"
+        )
+        out.append(block)
+    
+    jobs_str = "\n".join(out) if out else "<i>No active tasks.</i>\n"
+    
+    sys_text = (
+        f"⌬ <b>𝗕𝗢𝗧 𝗦𝗧𝗔𝗧𝗦</b>\n"
+        f"╭ CPU  : {cpu_usage}%\n"
+        f"┊ RAM  : {mem_usage}%\n"
+        f"┊ FREE : {disk_usage:.2f}GB\n"
+        f"╰ UP   : {h}h{m}m{s}s\n"
     )
-    await message.reply(text)
+    await message.reply(f"{jobs_str}\n{sys_text}")
+
+@app.on_message(filters.regex(r"^/c_(.+)$") | filters.regex(r"^/cancel_(.+)$"))
+async def cancel_command(client: Client, message: Message):
+    job_id = message.matches[0].group(1)
+    if job_id not in _active_jobs:
+        await message.reply("❌ Task not found or already completed.")
+        return
+        
+    job_state = _active_jobs[job_id]
+    if message.from_user.id != job_state["user_id"] and message.from_user.id not in ADMIN_IDS:
+        await message.reply("⛔ You don't have permission to cancel this task.")
+        return
+        
+    task = job_state.get("async_task")
+    if task:
+        task.cancel()
+        await message.reply(f"🛑 Kill signal transmitted to <code>{job_id}</code>.")
+    else:
+        job_state["status"] = "Cancelled"
+        await message.reply(f"🛑 Task <code>{job_id}</code> permanently removed from queue.")
 
 # ---------------------------------------------------------------------------
 # /fs — main forensic command
@@ -673,11 +768,12 @@ async def _on_start():
     async with app:
         logger.info("Alfred (MTProto) is now online and standing by.")
 
-        worker = asyncio.create_task(_queue_worker())
+        workers = [asyncio.create_task(_queue_worker()) for _ in range(MAX_CONCURRENT_JOBS)]
         try:
             await idle()
         finally:
-            worker.cancel()
+            for w in workers:
+                w.cancel()
 
 if __name__ == "__main__":
     if not BOT_TOKEN or not API_ID or not API_HASH:
