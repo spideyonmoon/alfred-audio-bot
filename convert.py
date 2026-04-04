@@ -135,7 +135,7 @@ async def _show_mode_menu(client: Client, ctx, sess_key: str, fmt: str):
         ]
         text = "🎵 <b>MP3 encoding mode?</b>"
 
-    elif fmt in ("flac", "alac"):
+    elif fmt == "flac":
         rows = [
             [btn("Level 0 (fastest)", "0")],
             [btn("Level 5 (default)", "5")],
@@ -166,7 +166,7 @@ async def _show_mode_menu(client: Client, ctx, sess_key: str, fmt: str):
         text = "🎵 <b>Opus bitrate?</b>"
 
     else:
-        # WAV, AIFF — no sub-menu needed
+        # WAV, AIFF, ALAC — no sub-menu needed
         await _start_conversion(client, ctx, sess_key, fmt, "pcm", "default")
         return
 
@@ -309,9 +309,10 @@ async def _start_conversion(client: Client, ctx, sess_key: str,
             parse_mode=ParseMode.HTML
         )
 
-        proc = await asyncio.to_thread(_run_ffmpeg, ffmpeg_cmd)
+        proc, stderr = await asyncio.to_thread(_run_ffmpeg, ffmpeg_cmd)
         if proc != 0 or not os.path.exists(out_path):
-            await status_msg.edit_text("❌ Conversion failed. FFmpeg returned an error.")
+            error_trace = f"\n<pre>{stderr[-500:]}</pre>" if stderr else ""
+            await status_msg.edit_text(f"❌ Conversion failed. FFmpeg returned an error:{error_trace}", parse_mode=ParseMode.HTML)
             return
 
         # Transfer tags from source to output
@@ -360,11 +361,11 @@ async def _start_conversion(client: Client, ctx, sess_key: str,
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _run_ffmpeg(cmd: list) -> int:
-    """Blocking FFmpeg call (run in thread)."""
+def _run_ffmpeg(cmd: list) -> tuple[int, str]:
+    """Blocking FFmpeg call (run in thread). Returns (returncode, stderr)."""
     import subprocess
     result = subprocess.run(cmd, capture_output=True)
-    return result.returncode
+    return result.returncode, result.stderr.decode(errors="replace")
 
 
 def _build_ffmpeg_args(fmt: str, mode: str, grade: str) -> tuple[str, list, str]:
@@ -386,8 +387,7 @@ def _build_ffmpeg_args(fmt: str, mode: str, grade: str) -> tuple[str, list, str]
         return "flac", ["-c:a", "flac", "-compression_level", lvl], f"FLAC Level {lvl}"
 
     elif fmt == "alac":
-        lvl = grade if grade.isdigit() else "5"
-        return "m4a", ["-c:a", "alac", "-compression_level", lvl], f"ALAC Level {lvl}"
+        return "m4a", ["-c:a", "alac"], f"ALAC Target"
 
     elif fmt == "aac":
         bps = grade if grade.isdigit() else "256"
