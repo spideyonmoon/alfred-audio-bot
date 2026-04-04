@@ -572,7 +572,7 @@ async def help_command(client: Client, message: Message):
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command("pong"))
 async def pong_command(client: Client, message: Message):
-    await message.reply("🏓 **PING! Alfred V3.5 Universal Scheduler is LIVE!**")
+    await message.reply("🏓 PING!")
 
 # ---------------------------------------------------------------------------
 # /stats
