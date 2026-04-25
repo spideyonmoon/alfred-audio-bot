@@ -147,7 +147,8 @@ async def _show_mode_menu(client: Client, ctx, sess_key: str, fmt: str):
         rows = [
             [btn("Level 0 (fastest)", "0")],
             [btn("Level 5 (default)", "5")],
-            [btn("Level 8 (smallest)", "8")]
+            [btn("Level 8 (smallest)", "8")],
+            [btn("Custom (Bit/Sample Rate)", "custom")]
         ]
         text = f"🎵 <b>{fmt.upper()} compression level?</b>"
 
@@ -215,6 +216,11 @@ async def _show_grade_menu(client: Client, query: CallbackQuery,
             [btn("V4", "4")]
         ]
         text = "🎵 <b>MP3 VBR quality?</b>\n<i>V0 ≈ 245 kbps avg — highest quality</i>"
+    elif fmt == "flac" and mode == "custom":
+        rows = [
+            [btn("16-bit", "16"), btn("24-bit", "24")]
+        ]
+        text = "🎵 <b>FLAC Bit Depth?</b>"
     else:
         # CBR / ABR
         rows = [
@@ -228,19 +234,37 @@ async def _show_grade_menu(client: Client, query: CallbackQuery,
     return None
 
 
+async def _show_samplerate_menu(client: Client, query: CallbackQuery,
+                             sess_key: str, fmt: str, mode: str, grade: str):
+    """Shows sample rate selection for FLAC custom mode."""
+    chat_id, src_id = sess_key.split(":")
+
+    def btn(label, sr): return InlineKeyboardButton(label, callback_data=f"cv:{chat_id}:{src_id}:{fmt}:{mode}:{grade}:{sr}")
+
+    rows = [
+        [btn("44.1 kHz", "44100"), btn("48 kHz", "48000")],
+        [btn("96 kHz", "96000"), btn("192 kHz", "192000")]
+    ]
+    text = f"🎵 <b>FLAC Sample Rate?</b>"
+
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                  reply_markup=InlineKeyboardMarkup(rows))
+    return None
+
 # ---------------------------------------------------------------------------
 # Callback router
 # ---------------------------------------------------------------------------
 async def handle_convert_callback(client: Client, query: CallbackQuery):
     await query.answer()
     parts = query.data.split(":")
-    # cv:{chat_id}:{src_id}:{fmt}[:{mode}[:{grade}]]
+    # cv:{chat_id}:{src_id}:{fmt}[:{mode}[:{grade}[:{samplerate}]]]
     if len(parts) < 4:
         return
 
     _, chat_id, src_id, fmt = parts[0], parts[1], parts[2], parts[3]
-    mode  = parts[4] if len(parts) >= 5 else None
-    grade = parts[5] if len(parts) >= 6 else None
+    mode       = parts[4] if len(parts) >= 5 else None
+    grade      = parts[5] if len(parts) >= 6 else None
+    samplerate = parts[6] if len(parts) >= 7 else None
 
     sess_key = f"{chat_id}:{src_id}"
     if sess_key not in _convert_sessions:
@@ -257,9 +281,13 @@ async def handle_convert_callback(client: Client, query: CallbackQuery):
         # Format chosen → show mode/level menu
         return await _show_mode_menu(client, query, sess_key, fmt)
 
-    elif grade is None and fmt == "mp3" and mode in ("vbr", "cbr", "abr"):
-        # MP3 mode chosen → show grade menu
+    elif grade is None and (fmt == "mp3" and mode in ("vbr", "cbr", "abr") or (fmt == "flac" and mode == "custom")):
+        # MP3 mode chosen or FLAC custom chosen → show grade/bitdepth menu
         return await _show_grade_menu(client, query, sess_key, fmt, mode)
+
+    elif samplerate is None and fmt == "flac" and mode == "custom":
+        # FLAC bit depth chosen → show sample rate menu
+        return await _show_samplerate_menu(client, query, sess_key, fmt, mode, grade)
 
     else:
         # All params collected → return complete job payload for global scheduling
@@ -276,6 +304,7 @@ async def handle_convert_callback(client: Client, query: CallbackQuery):
             "fmt": fmt,
             "mode": effective_mode,
             "grade": effective_grade,
+            "samplerate": samplerate or "default",
             "ctx": query,
             "session": session
         }
@@ -296,6 +325,7 @@ async def _run_convert_job(job: dict):
     fmt       = job["fmt"]
     mode      = job["mode"]
     grade     = job["grade"]
+    samplerate = job.get("samplerate", "default")
 
     source_msg = session["source_msg"]
     file_obj   = session["file_obj"]
@@ -334,7 +364,7 @@ async def _run_convert_job(job: dict):
 
         # Build FFmpeg command. Protect against identical filesystem string overwritings by 
         # injecting the output directly into a dedicated `/out/` child directory.
-        out_ext, cmd_suffix, out_label = _build_ffmpeg_args(fmt, mode, grade)
+        out_ext, cmd_suffix, out_label = _build_ffmpeg_args(fmt, mode, grade, samplerate)
         out_filename = f"{src_stem}.{out_ext}"
         
         out_dir = os.path.join(tmp_dir, "out")
@@ -403,7 +433,7 @@ async def _run_convert_job(job: dict):
 
 
 
-def _build_ffmpeg_args(fmt: str, mode: str, grade: str) -> tuple[str, list, str]:
+def _build_ffmpeg_args(fmt: str, mode: str, grade: str, samplerate: str = "default") -> tuple[str, list, str]:
     """Returns (output_extension, [extra ffmpeg args], display_label)."""
 
     if fmt == "mp3":
@@ -418,8 +448,16 @@ def _build_ffmpeg_args(fmt: str, mode: str, grade: str) -> tuple[str, list, str]
             return "mp3", ["-c:a", "libmp3lame", "-b:a", f"{bps}k", "-abr", "1"], f"MP3 ABR {bps}k"
 
     elif fmt == "flac":
-        lvl = grade if grade.isdigit() else "5"
-        return "flac", ["-c:a", "flac", "-compression_level", lvl], f"FLAC Level {lvl}"
+        if mode == "custom":
+            depth = grade if grade in ("16", "24") else "16"
+            sr_str = samplerate if samplerate in ("44100", "48000", "96000", "192000") else "44100"
+            sfmt = "s16" if depth == "16" else "s32"
+            
+            args = ["-c:a", "flac", "-compression_level", "5", "-sample_fmt", sfmt, "-ar", sr_str]
+            return "flac", args, f"FLAC {depth}-bit {int(sr_str)//1000}kHz"
+        else:
+            lvl = grade if grade.isdigit() else "5"
+            return "flac", ["-c:a", "flac", "-compression_level", lvl], f"FLAC Level {lvl}"
 
     elif fmt == "alac":
         return "m4a", ["-c:a", "alac"], f"ALAC Target"
