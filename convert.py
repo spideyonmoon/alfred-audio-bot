@@ -406,8 +406,8 @@ async def _run_convert_job(job: dict):
 
         await status_msg.edit_text("📤 <b>Uploading...</b>", parse_mode=ParseMode.HTML)
 
-        await source_msg.reply_document(
-            document            = out_path,
+        await source_msg.reply_audio(
+            audio               = out_path,
             file_name           = out_filename,
             caption             = caption,
             parse_mode          = ParseMode.HTML,
