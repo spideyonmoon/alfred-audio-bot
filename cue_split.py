@@ -384,26 +384,23 @@ async def _run_cue_job(job: dict):
                 trk_title   = trk.get("title", os.path.splitext(os.path.basename(fp))[0])
                 trk_artist  = trk.get("performer", global_meta.get("album_artist", ""))
 
-                await client.send_audio(
-                    chat_id             = chat_id,
+                await audio_msg.reply_audio(
                     audio               = fp,
                     title               = trk_title,
                     performer           = trk_artist,
                     thumb               = local_thumb if local_thumb and os.path.exists(local_thumb) else None,
                     duration            = duration,
-                    reply_to_message_id = audio_msg.id,
+                    quote               = True,
                 )
                 await asyncio.sleep(1.5)
             except Exception as e:
                 logger.error("Upload error for %s: %r", fp, e)
 
         await status_msg.delete()
-        await client.send_message(
-            chat_id             = chat_id,
-            message_thread_id   = thread_id,
+        await audio_msg.reply_text(
             text                = f"✅ <b>Done!</b> {total_tracks} tracks split and uploaded.",
             parse_mode          = ParseMode.HTML,
-            reply_to_message_id = audio_msg.id,
+            quote               = True,
         )
 
     except Exception:

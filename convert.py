@@ -406,14 +406,12 @@ async def _run_convert_job(job: dict):
 
         await status_msg.edit_text("📤 <b>Uploading...</b>", parse_mode=ParseMode.HTML)
 
-        await client.send_document(
-            chat_id             = chat_id,
+        await source_msg.reply_document(
             document            = out_path,
             file_name           = out_filename,
             caption             = caption,
             parse_mode          = ParseMode.HTML,
-            message_thread_id   = thread_id,
-            reply_to_message_id = source_msg.id,
+            quote               = True,
             progress            = progress_callback,
             progress_args       = (status_msg, "Uploading Converted File", time.time(), [0.0], job.get("job_id"))
         )
