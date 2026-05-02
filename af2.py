@@ -624,7 +624,7 @@ class SpectralEngine:
             "Transcode Artifacts: Lossless encoders (FLAC/ALAC) will perfectly preserve lossy characteristics if the source material was already degraded prior to encoding."
         ]
         ext = self.filepath.suffix.lower()
-        if ext in {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wma"}:
+        if ext in {".mp3", ".aac", ".ogg", ".opus", ".wma"}:
             mp3_match = ""
             for br, freq in sorted(self.MP3_CUTOFFS.items(), reverse=True):
                 if abs(cutoff_hz - freq) <= 300 and cutoff_hz < 20000: mp3_match = f" — matches ~{br}kbps MP3 encoder profile"; break

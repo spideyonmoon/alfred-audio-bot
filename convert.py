@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Formats that are lossy (input). Used for ⚠ disclaimer on lossy→lossless.
 # ---------------------------------------------------------------------------
-_LOSSY_FORMATS = {".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma"}
+_LOSSY_FORMATS = {".mp3", ".aac", ".ogg", ".opus", ".wma"}
 _LOSSLESS_FORMATS = {".flac", ".wav", ".aiff", ".aif", ".ape", ".wv", ".alac", ".w64"}
 
 # ---------------------------------------------------------------------------
