@@ -371,7 +371,7 @@ async def _run_convert_job(job: dict):
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, out_filename)
 
-        ffmpeg_cmd = ["ffmpeg", "-y", "-i", src_path] + cmd_suffix + [out_path]
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", src_path, "-vn"] + cmd_suffix + [out_path]
 
         await status_msg.edit_text(
             f"⚙️ <b>Converting to {out_label}...</b>",
