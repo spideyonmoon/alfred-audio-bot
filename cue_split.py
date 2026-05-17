@@ -17,6 +17,9 @@ import re
 import shutil
 import glob
 import tempfile
+import uuid
+import sys
+import time
 
 from pathlib import Path
 from typing import Optional
@@ -89,11 +92,31 @@ async def handle_cuesplit_command(client: Client, message: Message):
     work_dir = os.path.join(tempfile.gettempdir(), f"alfred_cs_{user_id}_{target.id}")
     os.makedirs(work_dir, exist_ok=True)
     local_audio_path = os.path.join(work_dir, audio_filename)
+    
+    dl_job_id = uuid.uuid4().hex[:6]
+    if "bot" in sys.modules:
+        sys.modules["bot"]._active_jobs[dl_job_id] = {
+            "job_id": dl_job_id,
+            "user_id": user_id,
+            "username": getattr(message.from_user, "username", "Unknown") or "Unknown",
+            "type": "CUE",
+            "filename": audio_filename,
+            "status": "Downloading audio (background)",
+            "progress": 0.0,
+            "speed": "0 B/s",
+            "eta": "-",
+            "downloaded": "0 B",
+            "total": "0 B",
+            "start_time": time.time(),
+            "async_task": None
+        }
 
     # ── Start download in background IMMEDIATELY ──
     download_task = asyncio.create_task(
-        _download_audio(client, target, local_audio_path)
+        _download_audio(client, target, local_audio_path, dl_job_id)
     )
+    if "bot" in sys.modules:
+        sys.modules["bot"]._active_jobs[dl_job_id]["async_task"] = download_task
 
     prompt = await message.reply(
         "✅ <b>Audio queued for download.</b>\n\n"
@@ -114,13 +137,19 @@ async def handle_cuesplit_command(client: Client, message: Message):
         "work_dir":        work_dir,
         "cue_path":        None,
         "cover_path":      None,
+        "dl_job_id":       dl_job_id,
     }
 
 
-async def _download_audio(client: Client, msg: Message, dest: str) -> bool:
+async def _download_audio(client: Client, msg: Message, dest: str, job_id: str) -> bool:
     """Background task: download audio via MTProto to dest path."""
     try:
-        await client.download_media(msg, file_name=dest)
+        await client.download_media(
+            msg, 
+            file_name=dest,
+            progress=progress_callback,
+            progress_args=(None, "Downloading audio (background)", time.time(), [0.0], job_id)
+        )
         return os.path.exists(dest) and os.path.getsize(dest) > 0
     except Exception as e:
         logger.error("CUE background download failed: %r", e)
@@ -194,6 +223,10 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
         state["art_msg_id"]  = message.id
         state["status"] = "processing"
         
+        dl_job_id = state.get("dl_job_id")
+        if dl_job_id and "bot" in sys.modules:
+            sys.modules["bot"]._active_jobs.pop(dl_job_id, None)
+        
         # Clean up wait status and dispatch the Job payload to bot.py
         del CUE_WAITING_LIST[user_id]
         
@@ -226,6 +259,10 @@ async def handle_cuesplit_callback(client: Client, query: CallbackQuery):
     state["cover_path"] = None
     state["art_msg_id"] = None
     state["status"]     = "processing"
+    
+    dl_job_id = state.get("dl_job_id")
+    if dl_job_id and "bot" in sys.modules:
+        sys.modules["bot"]._active_jobs.pop(dl_job_id, None)
 
     return {
         "type": "cue",
