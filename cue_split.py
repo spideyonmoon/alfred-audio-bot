@@ -32,7 +32,7 @@ from pyrogram.types import (
 )
 from pyrogram.enums import ParseMode
 
-from utils import run_async_subprocess, safe_edit, safe_delete
+from utils import run_async_subprocess, safe_edit, safe_delete, progress_callback
 
 # Mutagen for tagging
 try:
