@@ -24,7 +24,8 @@ from typing import Optional
 from pyrogram import Client
 from pyrogram.types import (
     Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ForceReply
 )
 from pyrogram.enums import ParseMode
 
@@ -96,9 +97,10 @@ async def handle_cuesplit_command(client: Client, message: Message):
 
     prompt = await message.reply(
         "✅ <b>Audio queued for download.</b>\n\n"
-        "Now send the <b>.cue file</b> as a document.",
+        "<i>Please reply to this specific message</i> with your <b>.cue file</b>.",
         parse_mode=ParseMode.HTML,
-        quote=True
+        quote=True,
+        reply_markup=ForceReply(selective=True)
     )
 
     CUE_WAITING_LIST[user_id] = {
@@ -164,7 +166,7 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
         art_prompt = await client.send_message(
             chat_id              = state["chat_id"],
             message_thread_id    = state["thread_id"],
-            text                 = "🎨 <b>CUE received.</b>\n\nSend album art (photo/image doc) or click Skip.",
+            text                 = "🎨 <b>CUE received.</b>\n\n<i>Reply to this message</i> with an album art (photo/image doc) or click Skip.",
             parse_mode           = ParseMode.HTML,
             reply_markup         = keyboard,
             reply_to_message_id  = state["audio_msg"].id,
