@@ -187,28 +187,28 @@ def extract_sox_stats(filepath: Path) -> dict[str, str]:
     return stats
 
 def extract_loudness(filepath: Path) -> LoudnessProfile:
-    r = _run(["ffmpeg", "-i", str(filepath), "-vn", "-af", "astats=metadata=1:reset=1", "-f", "null", "-"])
-    def _avg(pattern: str) -> str:
+    r = _run(["ffmpeg", "-i", str(filepath), "-vn", "-af", "astats", "-f", "null", "-"])
+    def _last(pattern: str) -> str:
         hits = re.findall(pattern, r.stderr)
         if not hits: return ""
-        try:
-            vals = [float(v) for v in hits if v not in ("inf", "-inf", "nan") and not v.lower().startswith("n")]
-            return f"{sum(vals) / len(vals):.2f}" if vals else ""
-        except ValueError: return hits[0]
+        v = hits[-1]
+        if v in ("inf", "-inf", "nan") or v.lower().startswith("n"): return ""
+        try: return f"{float(v):.2f}"
+        except ValueError: return v
 
     lp = LoudnessProfile()
-    lp.peak_db = _avg(r"Peak level dB:\s*([-\d.]+)")
-    lp.rms_db = _avg(r"RMS level dB:\s*([-\d.inf]+)")
-    lp.rms_peak_db = _avg(r"RMS peak dB:\s*([-\d.inf]+)")
-    lp.rms_trough_db = _avg(r"RMS trough dB:\s*([-\d.inf]+)")
-    lp.noise_floor_db = _avg(r"Noise floor dB:\s*([-\d.inf]+)")
-    lp.dynamic_range_db = _avg(r"Dynamic range:\s*([-\d.inf]+)")
-    lp.crest_factor_db = _avg(r"Crest factor:\s*([-\d.inf]+)")
-    lp.flat_factor = _avg(r"Flat factor:\s*([\d.]+)")
-    lp.peak_count = _avg(r"Peak count:\s*([\d.]+)")
-    lp.sox_entropy = _avg(r"Entropy:\s*([\d.]+)")
-    lp.dc_offset = _avg(r"DC offset:\s*([-\d.]+)")
-    lp.zero_crossings_rate = _avg(r"Zero crossings rate:\s*([\d.]+)")
+    lp.peak_db = _last(r"Peak level dB:\s*([-\w.]+)")
+    lp.rms_db = _last(r"RMS level dB:\s*([-\w.]+)")
+    lp.rms_peak_db = _last(r"RMS peak dB:\s*([-\w.]+)")
+    lp.rms_trough_db = _last(r"RMS trough dB:\s*([-\w.]+)")
+    lp.noise_floor_db = _last(r"Noise floor dB:\s*([-\w.]+)")
+    lp.dynamic_range_db = _last(r"Dynamic range:\s*([-\w.]+)")
+    lp.crest_factor_db = _last(r"Crest factor:\s*([-\w.]+)")
+    lp.flat_factor = _last(r"Flat factor:\s*([-\w.]+)")
+    lp.peak_count = _last(r"Peak count:\s*([-\w.]+)")
+    lp.sox_entropy = _last(r"Entropy:\s*([-\w.]+)")
+    lp.dc_offset = _last(r"DC offset:\s*([-\w.]+)")
+    lp.zero_crossings_rate = _last(r"Zero crossings rate:\s*([-\w.]+)")
 
     r2 = _run(["ffmpeg", "-i", str(filepath), "-vn", "-af", "aresample=48000,ebur128=peak=true", "-f", "null", "-"])
     def _field(pat: str) -> str:

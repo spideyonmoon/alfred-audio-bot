@@ -81,10 +81,7 @@ async def progress_callback(
         f"┖ <b>ETA:</b> <code>{eta_str}</code>"
     )
     
-    try:
-        await status_msg.edit_text(text, parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
+    await safe_edit(status_msg, text, parse_mode=ParseMode.HTML)
 
 async def run_async_subprocess(cmd: list) -> tuple[int, str]:
     """
@@ -103,3 +100,19 @@ async def run_async_subprocess(cmd: list) -> tuple[int, str]:
     except asyncio.CancelledError:
         proc.kill()
         raise
+
+async def safe_edit(msg: Message, text: str, **kwargs):
+    if not msg: return None
+    try:
+        return await msg.edit_text(text, **kwargs)
+    except FloodWait:
+        pass
+    except Exception:
+        pass
+
+async def safe_delete(msg: Message):
+    if not msg: return
+    try:
+        await msg.delete()
+    except Exception:
+        pass

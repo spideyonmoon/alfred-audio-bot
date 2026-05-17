@@ -28,7 +28,7 @@ from pyrogram.types import (
 )
 from pyrogram.enums import ParseMode
 
-from utils import run_async_subprocess
+from utils import run_async_subprocess, safe_edit, safe_delete
 
 # Mutagen for tagging
 try:
@@ -69,7 +69,7 @@ async def handle_cuesplit_command(client: Client, message: Message):
 
     if target.document:
         filename = getattr(file_obj, "file_name", "").lower()
-        valid_exts = (".flac", ".alac", ".wav", ".aiff", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".dsf", ".dff")
+        valid_exts = (".flac", ".alac", ".wav", ".aiff", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".dsf", ".dff", ".wv")
         if filename and not filename.endswith(valid_exts):
             await message.reply("❌ Invalid format. Audio splitting can only process audio files.")
             return
@@ -152,14 +152,8 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
                 f.write(cue_io.getbuffer())
 
         # Clean up prompts
-        try:
-            await client.delete_messages(state["chat_id"], [state["prompt_msg_id"]])
-        except Exception:
-            pass
-        try:
-            await message.delete()
-        except Exception:
-            pass
+        await client.delete_messages(state["chat_id"], [state["prompt_msg_id"]])
+        await client.delete_messages(message.chat.id, [message.id])
 
         state["cue_path"] = local_cue_path
         state["status"]   = "waiting_art"
@@ -268,17 +262,14 @@ async def _run_cue_job(job: dict):
         logging.error("CUE missing dynamic status_msg element.")
         return
 
-    await status_msg.edit_text("⚙️ <b>Processing CUE and Audio...</b>", parse_mode=ParseMode.HTML)
+    await safe_edit(status_msg, "⚙️ <b>Processing CUE and Audio...</b>", parse_mode=ParseMode.HTML)
     local_thumb    = None
 
     try:
         # Clean up lingering prompts
         to_delete = [m for m in [prompt_msg_id, art_msg_id] if m]
-        if to_delete:
-            try:
-                await client.delete_messages(chat_id, to_delete)
-            except Exception:
-                pass
+        for m_id in to_delete:
+            await client.delete_messages(chat_id, [m_id])
 
         status_msg = await client.send_message(
             chat_id             = chat_id,
@@ -291,7 +282,7 @@ async def _run_cue_job(job: dict):
         # ── Await the background download (already started) ──
         download_ok = await download_task
         if not download_ok or not os.path.exists(audio_path):
-            await status_msg.edit_text("❌ Audio download failed.")
+            await safe_edit(status_msg, "❌ Audio download failed.")
             return
 
         # Thumbnail for Telegram audio messages
@@ -300,13 +291,13 @@ async def _run_cue_job(job: dict):
             await _generate_thumbnail(cover_path, local_thumb)
 
         # ── Parse CUE ──
-        await status_msg.edit_text("⚙️ <b>Parsing CUE metadata...</b>", parse_mode=ParseMode.HTML)
+        await safe_edit(status_msg, "⚙️ <b>Parsing CUE metadata...</b>", parse_mode=ParseMode.HTML)
         cue_data    = _parse_cue_data(cue_path)
         tracks      = cue_data["tracks"]
         global_meta = cue_data["meta"]
 
         if not tracks:
-            await status_msg.edit_text("❌ No TRACK entries found in the CUE file.")
+            await safe_edit(status_msg, "❌ No TRACK entries found in the CUE file.")
             return
 
         # ── Split ──
@@ -330,7 +321,8 @@ async def _run_cue_job(job: dict):
             end_sec   = tracks[i + 1]["start"] if (i + 1 < len(tracks)) else None
 
             try:
-                await status_msg.edit_text(
+                await safe_edit(
+                    status_msg,
                     f"🔪 <b>Splitting</b> track {track_num}/{total_tracks}...",
                     parse_mode=ParseMode.HTML
                 )
@@ -369,10 +361,11 @@ async def _run_cue_job(job: dict):
         # ── Upload ──
         split_files = sorted(glob.glob(os.path.join(output_dir, "*")))
         if not split_files:
-            await status_msg.edit_text("❌ Splitting finished but no output files were found.")
+            await safe_edit(status_msg, "❌ Splitting finished but no output files were found.")
             return
 
-        await status_msg.edit_text(
+        await safe_edit(
+            status_msg,
             f"📤 <b>Uploading {len(split_files)} tracks...</b>",
             parse_mode=ParseMode.HTML
         )
@@ -391,22 +384,24 @@ async def _run_cue_job(job: dict):
                     thumb               = local_thumb if local_thumb and os.path.exists(local_thumb) else None,
                     duration            = duration,
                     quote               = True,
+                    message_thread_id   = thread_id,
                 )
                 await asyncio.sleep(1.5)
             except Exception as e:
                 logger.error("Upload error for %s: %r", fp, e)
 
-        await status_msg.delete()
+        await client.delete_messages(chat_id, [status_msg.id])
         await audio_msg.reply_text(
             text                = f"✅ <b>Done!</b> {total_tracks} tracks split and uploaded.",
             parse_mode          = ParseMode.HTML,
             quote               = True,
+            message_thread_id   = thread_id,
         )
 
     except Exception:
         logger.exception("CUE splitting critical error")
         try:
-            await status_msg.edit_text("❌ <b>Critical error during splitting.</b>", parse_mode=ParseMode.HTML)
+            await safe_edit(status_msg, "❌ <b>Critical error during splitting.</b>", parse_mode=ParseMode.HTML)
         except Exception:
             pass
     finally:

@@ -21,11 +21,12 @@ from typing import Optional
 from pyrogram import Client
 from pyrogram.types import (
     Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ForceReply
 )
 from pyrogram.enums import ParseMode
 
-from utils import progress_callback, run_async_subprocess
+from utils import progress_callback, run_async_subprocess, safe_edit, safe_delete
 
 try:
     from mutagen import File as MutagenFile
@@ -337,7 +338,7 @@ async def _run_convert_job(job: dict):
         logger.error("Job provided no status_msg fallback framework!")
         return
 
-    await status_msg.edit_text("📥 <b>Downloading source file...</b>", parse_mode=ParseMode.HTML)
+    await safe_edit(status_msg, "📥 <b>Downloading source file...</b>", parse_mode=ParseMode.HTML)
 
     tmp_dir     = tempfile.mkdtemp(prefix="alfred_cv_")
     src_path    = None
@@ -354,7 +355,7 @@ async def _run_convert_job(job: dict):
             progress_args=(status_msg, "Downloading Source", start_time, [0.0], job.get("job_id"))
         )
         if not src_path or not os.path.exists(src_path):
-            await status_msg.edit_text("❌ Download failed.")
+            await safe_edit(status_msg, "❌ Download failed.")
             return
 
         src_suffix   = Path(src_path).suffix.lower()
@@ -373,7 +374,8 @@ async def _run_convert_job(job: dict):
 
         ffmpeg_cmd = ["ffmpeg", "-y", "-i", src_path, "-vn"] + cmd_suffix + [out_path]
 
-        await status_msg.edit_text(
+        await safe_edit(
+            status_msg,
             f"⚙️ <b>Converting to {out_label}...</b>",
             parse_mode=ParseMode.HTML
         )
@@ -381,7 +383,7 @@ async def _run_convert_job(job: dict):
         retcode, stderr = await run_async_subprocess(ffmpeg_cmd)
         if retcode != 0 or not os.path.exists(out_path):
             error_trace = f"\n<pre>{stderr[-500:]}</pre>" if stderr else ""
-            await status_msg.edit_text(f"❌ Conversion failed. FFmpeg returned an error:{error_trace}", parse_mode=ParseMode.HTML)
+            await safe_edit(status_msg, f"❌ Conversion failed. FFmpeg returned an error:{error_trace}", parse_mode=ParseMode.HTML)
             return
 
         # Transfer tags from source to output
@@ -404,7 +406,7 @@ async def _run_convert_job(job: dict):
         if src_is_lossy and tgt_is_lossless:
             caption += _LOSSY_IN_LOSSLESS_WARNING
 
-        await status_msg.edit_text("📤 <b>Uploading...</b>", parse_mode=ParseMode.HTML)
+        await safe_edit(status_msg, "📤 <b>Uploading...</b>", parse_mode=ParseMode.HTML)
 
         await source_msg.reply_audio(
             audio               = out_path,
@@ -412,15 +414,16 @@ async def _run_convert_job(job: dict):
             caption             = caption,
             parse_mode          = ParseMode.HTML,
             quote               = True,
+            message_thread_id   = thread_id,
             progress            = progress_callback,
             progress_args       = (status_msg, "Uploading Converted File", time.time(), [0.0], job.get("job_id"))
         )
-        await status_msg.delete()
+        await safe_delete(status_msg)
 
     except Exception as e:
         logger.exception("Conversion error")
         try:
-            await status_msg.edit_text(f"❌ <b>Error:</b> {e}", parse_mode=ParseMode.HTML)
+            await safe_edit(status_msg, f"❌ <b>Error:</b> {e}", parse_mode=ParseMode.HTML)
         except Exception:
             pass
     finally:

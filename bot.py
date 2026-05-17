@@ -28,7 +28,7 @@ from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineK
 from pyrogram.enums import ParseMode
 
 from af2 import build_report, build_info_report, ForensicReport, generate_spectrogram
-from utils import progress_callback
+from utils import progress_callback, safe_edit, safe_delete
 import health
 import cue_split
 import convert
@@ -188,6 +188,30 @@ def make_telegraph_content(report: ForensicReport, include_assessment: bool = Tr
     forensic_lines.extend(add_line("Precision: ",   tec.precision))
     forensic_lines.extend(add_line("File Size: ",   f"{report.file_size_mb:.1f}", " MB"))
     forensic_lines.extend(add_line("Duration: ",    tec.duration))
+    
+    if tec.sample_encoding and "flac" in tec.sample_encoding.lower() and report.file_size_mb > 0:
+        try:
+            # Calculate uncompressed PCM size: SampleRate * Channels * (BitDepth/8) * Duration(s)
+            s_rate = float(tec.sample_rate)
+            chans = float(tec.channels)
+            b_depth = float(tec.precision.replace("-bit", ""))
+            
+            # Parse duration MM:SS
+            d_parts = tec.duration.split(":")
+            if len(d_parts) == 2:
+                dur_sec = int(d_parts[0]) * 60 + float(d_parts[1])
+            elif len(d_parts) == 3:
+                dur_sec = int(d_parts[0]) * 3600 + int(d_parts[1]) * 60 + float(d_parts[2])
+            else:
+                dur_sec = 0
+                
+            if dur_sec > 0:
+                uncomp_bytes = s_rate * chans * (b_depth / 8.0) * dur_sec
+                uncomp_mb = uncomp_bytes / (1024 * 1024)
+                ratio = (report.file_size_mb / uncomp_mb) * 100
+                forensic_lines.extend(add_line("Compression: ", f"{ratio:.1f}", "%"))
+        except Exception:
+            pass
 
     forensic_lines.extend([br(), b("── Level Bookends ──"), br()])
     forensic_lines.extend(add_line("Signal Ceiling: ", lp.peak_db,      " dBFS"))
@@ -304,7 +328,7 @@ async def enqueue_universal_task(job: dict, ctx):
     if _user_queue_counts[user_id] >= MAX_QUEUE_PER_USER:
         msg = f"⏳ **You have reached the maximum queue limit ({MAX_QUEUE_PER_USER}). Please wait for a slot.**"
         if isinstance(ctx, CallbackQuery):
-            await ctx.edit_message_text(msg)
+            await safe_edit(ctx.message, msg)
         else:
             await ctx.reply(msg, quote=True)
         return
@@ -335,7 +359,8 @@ async def enqueue_universal_task(job: dict, ctx):
     text = f"✅ Queued. Position: <b>{queue_pos + 1}</b>.\n⋗ Stop: /c_{job_id}"
     
     if isinstance(ctx, CallbackQuery):
-        status_msg = await ctx.edit_message_text(text, parse_mode=ParseMode.HTML)
+        await safe_edit(ctx.message, text, parse_mode=ParseMode.HTML)
+        status_msg = ctx.message
     else:
         status_msg = await ctx.reply(text, parse_mode=ParseMode.HTML, quote=True)
 
@@ -422,7 +447,7 @@ async def _run_forensic_job(job: dict):
 
     status_msg = job.get("status_msg")
     if status_msg:
-        await status_msg.edit_text("📥 <b>Downloading...</b>", parse_mode=ParseMode.HTML)
+        await safe_edit(status_msg, "📥 <b>Downloading...</b>", parse_mode=ParseMode.HTML)
     else:
         status_msg = await message.reply("📥 <b>Downloading...</b>", quote=True)
         
@@ -444,11 +469,10 @@ async def _run_forensic_job(job: dict):
         filename  = getattr(file_obj, "file_name", temp_path.name)
         logger.info("Analysis start | user=%s chat=%d file=%s flags=%s", username, chat_id, filename, flags)
 
-        # Spec-only: just generate and send the spectrogram, done
         job_id = job.get("job_id")
         if want_spec and not want_info:
             if job_id and job_id in _active_jobs: _active_jobs[job_id]["status"] = "Generating spectrogram..."
-            await status_msg.edit_text("📊 <b>Generating spectrogram...</b>")
+            await safe_edit(status_msg, "📊 <b>Generating spectrogram...</b>", parse_mode=ParseMode.HTML)
             spec_path = await asyncio.wait_for(
                 asyncio.to_thread(generate_spectrogram, temp_path),
                 timeout=120
@@ -459,21 +483,19 @@ async def _run_forensic_job(job: dict):
                     file_name=f"{Path(filename).stem}_spectrogram.png",
                     caption=f"<b>Spectrogram</b> — {filename}"
                 )
-                await status_msg.delete()
+                await safe_delete(status_msg)
             else:
-                await status_msg.edit_text("❌ Spectrogram generation failed.")
+                await safe_edit(status_msg, "❌ Spectrogram generation failed.", parse_mode=ParseMode.HTML)
             return
 
-        # Full/partial analysis
         if job_id and job_id in _active_jobs: _active_jobs[job_id]["status"] = "Analysing..."
-        await status_msg.edit_text("🔬 <b>Analysing...</b>")
+        await safe_edit(status_msg, "🔬 <b>Analysing...</b>", parse_mode=ParseMode.HTML)
         report = await asyncio.wait_for(
             asyncio.to_thread(build_report, temp_path),
             timeout=300
         )
         spec_path = report.spectrogram_path
 
-        # Build caption
         t, tec = report.tags, report.technical
         artist      = t.artist   or "Unknown Artist"
         track_title = t.title    or "Unknown Title"
@@ -486,11 +508,15 @@ async def _run_forensic_job(job: dict):
         sr_raw       = tec.sample_rate.strip()
         sample_rate_fmt = f"{int(sr_raw):,} Hz" if sr_raw.isdigit() else sr_raw
         precision_fmt   = f" | {tec.precision}" if tec.precision else ""
+        
+        comp_ratio = ""
+        if "FLAC" in codec_raw and hasattr(report, "flac_ratio"):
+             comp_ratio = f" | {report.flac_ratio:.1%}"
 
         page_url = None
         if want_info:
             if job_id and job_id in _active_jobs: _active_jobs[job_id]["status"] = "Uploading to Telegraph..."
-            await status_msg.edit_text("🌐 <b>Uploading to Telegraph...</b>")
+            await safe_edit(status_msg, "🌐 <b>Uploading to Telegraph...</b>", parse_mode=ParseMode.HTML)
             content  = make_telegraph_content(report, include_assessment=want_assessment)
             title_fmt = f"Analysis on {filename}"
             page_url  = await upload_to_telegraph(title_fmt, content)
@@ -509,7 +535,7 @@ async def _run_forensic_job(job: dict):
 
         # Send results
         if want_spec and spec_path and spec_path.exists():
-            await status_msg.edit_text("📤 <b>Uploading Spectrogram...</b>")
+            await safe_edit(status_msg, "📤 <b>Uploading Spectrogram...</b>", parse_mode=ParseMode.HTML)
             await message.reply_document(
                 document=str(spec_path),
                 file_name=f"{Path(filename).stem}_spectrogram.png",
@@ -517,17 +543,17 @@ async def _run_forensic_job(job: dict):
                 progress=progress_callback,
                 progress_args=(status_msg, "Uploading Spectrogram", time.time(), [0.0], job.get("job_id"))
             )
-            await status_msg.delete()
+            await safe_delete(status_msg)
         elif want_info:
-            await status_msg.edit_text(caption_text, disable_web_page_preview=False)
+            await safe_edit(status_msg, caption_text, disable_web_page_preview=False)
         else:
-            await status_msg.delete()
+            await safe_delete(status_msg)
 
     except asyncio.TimeoutError:
-        await status_msg.edit_text("❌ <b>Analysis timed out.</b> The file may be too long or the system is overloaded.")
+        await safe_edit(status_msg, "❌ <b>Analysis timed out.</b> The file may be too long or the system is overloaded.", parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.exception("Analysis error")
-        await status_msg.edit_text(f"❌ <b>Process Interrupted:</b> {e}")
+        await safe_edit(status_msg, f"❌ <b>Process Interrupted:</b> {e}", parse_mode=ParseMode.HTML)
     finally:
         if file_path_str and Path(file_path_str).exists():
             Path(file_path_str).unlink(missing_ok=True)
