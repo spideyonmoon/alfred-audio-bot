@@ -414,7 +414,6 @@ async def _run_convert_job(job: dict):
             caption             = caption,
             parse_mode          = ParseMode.HTML,
             quote               = True,
-            message_thread_id   = thread_id,
             progress            = progress_callback,
             progress_args       = (status_msg, "Uploading Converted File", time.time(), [0.0], job.get("job_id"))
         )

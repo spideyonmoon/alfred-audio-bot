@@ -422,7 +422,6 @@ async def _run_cue_job(job: dict):
                     thumb               = local_thumb if local_thumb and os.path.exists(local_thumb) else None,
                     duration            = duration,
                     quote               = True,
-                    message_thread_id   = thread_id,
                 )
                 await asyncio.sleep(1.5)
             except Exception as e:
@@ -433,7 +432,6 @@ async def _run_cue_job(job: dict):
             text                = f"✅ <b>Done!</b> {total_tracks} tracks split and uploaded.",
             parse_mode          = ParseMode.HTML,
             quote               = True,
-            message_thread_id   = thread_id,
         )
 
     except Exception:
