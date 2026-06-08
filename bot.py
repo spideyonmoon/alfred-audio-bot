@@ -591,11 +591,92 @@ async def help_command(client: Client, message: Message):
         "  <code>/cnv &lt;format&gt;</code> — Convert audio\n"
         "  <i>Reply to an audio file. Omit format for interactive menu.</i>\n"
         "  Supported: <code>flac alac mp3 aac ogg opus wav aiff</code>\n\n"
+        "<b>Log Checker</b>\n"
+        "  <code>/log</code> — Check an EAC/XLD rip log for integrity\n\n"
         "<b>Utility</b>\n"
         "  <code>/stats</code> — Queue status and bot statistics\n"
         "  <code>/help</code> — This message\n"
     )
     await message.reply(text)
+
+# ---------------------------------------------------------------------------
+# /log — EAC/XLD rip log checker
+# ---------------------------------------------------------------------------
+_LOGCHECK_API = "https://logcheck.nirzak.win/api"
+
+_CHECKSUM_LABELS = {
+    "checksum_ok":       "✅ OK",
+    "checksum_missing":  "⚠ Missing",
+    "checksum_mismatch": "❌ Mismatch",
+}
+
+def _score_emoji(score: int) -> str:
+    if score == 100: return "💯"
+    if score >= 80:  return "🟢"
+    if score >= 50:  return "🟡"
+    return "🔴"
+
+@app.on_message(filters.command("log"))
+async def logcheck_command(client: Client, message: Message):
+    if not _check_auth(message):
+        await _reject_auth(message)
+        return
+
+    replied = message.reply_to_message
+    if not replied or not replied.document:
+        await message.reply("↩️ <i>Reply to a <code>.log</code> file with <code>/log</code>.</i>")
+        return
+
+    filename = getattr(replied.document, "file_name", "") or ""
+    if not filename.lower().endswith(".log"):
+        await message.reply("❌ Only <code>.log</code> files are supported.")
+        return
+
+    status_msg = await message.reply("📥 <b>Downloading log...</b>", parse_mode=ParseMode.HTML, quote=True)
+    file_path = None
+    try:
+        file_path = await client.download_media(replied, file_name="/tmp/downloads/")
+        if not file_path:
+            await safe_edit(status_msg, "❌ Download failed.", parse_mode=ParseMode.HTML)
+            return
+
+        await safe_edit(status_msg, "🔍 <b>Checking log...</b>", parse_mode=ParseMode.HTML)
+
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            with open(file_path, "rb") as f:
+                resp = await http.post(_LOGCHECK_API, files={"logfile": (filename, f)})
+
+        if resp.status_code != 200:
+            await safe_edit(status_msg, f"❌ API error: <code>{resp.status_code}</code>", parse_mode=ParseMode.HTML)
+            return
+
+        data = resp.json()
+        score    = data.get("score", "?")
+        ripper   = data.get("ripper", "Unknown")
+        version  = data.get("ripper_version", "")
+        checksum = _CHECKSUM_LABELS.get(data.get("checksum_state", ""), data.get("checksum_state", ""))
+        details  = data.get("details", [])
+        emoji    = _score_emoji(score) if isinstance(score, int) else "❓"
+
+        ripper_line = f"{ripper} {version}".strip()
+        details_text = "\n".join(f"  • {d}" for d in details) if details else "  <i>None</i>"
+
+        text = (
+            f"<blockquote><b>{filename}</b></blockquote>\n\n"
+            f"{emoji} <b>Score:</b> <code>{score}/100</code>\n"
+            f"🎙 <b>Ripper:</b> <code>{ripper_line}</code>\n"
+            f"🔐 <b>Checksum:</b> {checksum}\n\n"
+            f"<b>Details:</b>\n{details_text}"
+        )
+        await safe_edit(status_msg, text, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        logger.exception("Log check error")
+        await safe_edit(status_msg, f"❌ <b>Error:</b> {e}", parse_mode=ParseMode.HTML)
+    finally:
+        if file_path and Path(file_path).exists():
+            Path(file_path).unlink(missing_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # /pong - Diagnostic
