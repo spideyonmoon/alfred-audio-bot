@@ -94,8 +94,9 @@ async def handle_cuesplit_command(client: Client, message: Message):
     local_audio_path = os.path.join(work_dir, audio_filename)
     
     dl_job_id = uuid.uuid4().hex[:6]
-    if "bot" in sys.modules:
-        sys.modules["bot"]._active_jobs[dl_job_id] = {
+    jobs = _bot_jobs()
+    if jobs is not None:
+        jobs[dl_job_id] = {
             "job_id": dl_job_id,
             "user_id": user_id,
             "username": getattr(message.from_user, "username", "Unknown") or "Unknown",
@@ -108,15 +109,15 @@ async def handle_cuesplit_command(client: Client, message: Message):
             "downloaded": "0 B",
             "total": "0 B",
             "start_time": time.time(),
-            "async_task": None
+            "async_task": None,
         }
 
     # ── Start download in background IMMEDIATELY ──
     download_task = asyncio.create_task(
         _download_audio(client, target, local_audio_path, dl_job_id)
     )
-    if "bot" in sys.modules:
-        sys.modules["bot"]._active_jobs[dl_job_id]["async_task"] = download_task
+    if jobs is not None:
+        jobs[dl_job_id]["async_task"] = download_task
 
     prompt = await message.reply(
         "✅ <b>Audio queued for download.</b>\n\n"
@@ -215,10 +216,11 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
         state["status"] = "processing"
         
         dl_job_id = state.get("dl_job_id")
-        if dl_job_id and "bot" in sys.modules:
-            sys.modules["bot"]._active_jobs.pop(dl_job_id, None)
-        
-        # Clean up wait status and dispatch the Job payload to bot.py
+        if dl_job_id:
+            jobs = _bot_jobs()
+            if jobs is not None:
+                jobs.pop(dl_job_id, None)
+
         del CUE_WAITING_LIST[user_id]
         
         return {
@@ -252,8 +254,10 @@ async def handle_cuesplit_callback(client: Client, query: CallbackQuery):
     state["status"]     = "processing"
     
     dl_job_id = state.get("dl_job_id")
-    if dl_job_id and "bot" in sys.modules:
-        sys.modules["bot"]._active_jobs.pop(dl_job_id, None)
+    if dl_job_id:
+        jobs = _bot_jobs()
+        if jobs is not None:
+            jobs.pop(dl_job_id, None)
 
     return {
         "type": "cue",
@@ -267,10 +271,15 @@ async def handle_cuesplit_callback(client: Client, query: CallbackQuery):
 # ---------------------------------------------------------------------------
 # Core splitting pipeline
 # ---------------------------------------------------------------------------
+def _bot_jobs() -> dict | None:
+    bot = sys.modules.get("bot") or sys.modules.get("__main__")
+    return getattr(bot, "_active_jobs", None) if bot else None
+
 def _set_status(job_id: str, status: str, progress: float = None):
     try:
-        if job_id and "bot" in sys.modules:
-            entry = sys.modules["bot"]._active_jobs.get(job_id)
+        jobs = _bot_jobs()
+        if job_id and jobs is not None:
+            entry = jobs.get(job_id)
             if entry:
                 entry["status"] = status
                 if progress is not None:

@@ -60,8 +60,9 @@ async def progress_callback(
     # Intercept telemetry values globally if a job_id context exists
     try:
         import sys
-        if "bot" in sys.modules:
-            _active_jobs = sys.modules["bot"]._active_jobs
+        _bot_mod = sys.modules.get("bot") or sys.modules.get("__main__")
+        if _bot_mod and hasattr(_bot_mod, "_active_jobs"):
+            _active_jobs = _bot_mod._active_jobs
             if job_id and job_id in _active_jobs:
                 job_state = _active_jobs[job_id]
                 job_state["progress"] = percent
