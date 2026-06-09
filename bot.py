@@ -77,10 +77,14 @@ app = Client(
 _start_time     = time.monotonic()
 _total_analyses = 0
 _task_queue: asyncio.Queue = asyncio.Queue()
-_user_queue_counts: defaultdict[int, int] = defaultdict(int) 
+_user_queue_counts: defaultdict[int, int] = defaultdict(int)
 MAX_QUEUE_PER_USER = 5
 MAX_CONCURRENT_JOBS = 4
 _active_jobs: dict[str, dict] = {}
+
+# Live status boards — one per (chat_id, thread_id)
+# { (chat_id, thread_id): {"msg_id": int, "last_text": str} }
+_boards: dict[tuple[int, int], dict] = {}
 
 # ---------------------------------------------------------------------------
 # Auth helper
@@ -321,12 +325,81 @@ def make_telegraph_content(report: ForensicReport, include_assessment: bool = Tr
     return json.dumps(nodes, ensure_ascii=False)
 
 # ---------------------------------------------------------------------------
+# Live Status Board
+# ---------------------------------------------------------------------------
+def _build_progress_bar(percent: float, length: int = 15) -> str:
+    filled = int(round((percent / 100.0) * length))
+    empty  = length - filled
+    return "⬤" * filled + "○" * empty
+
+def _render_board(chat_id: int, thread_id: int) -> str:
+    jobs = [j for j in _active_jobs.values() if j.get("chat_id") == chat_id]
+    if not jobs:
+        uptime = int(time.monotonic() - _start_time)
+        uh, ur = divmod(uptime, 3600); um, us = divmod(ur, 60)
+        up_str = f"{uh}h {um}m" if uh else f"{um}m {us}s"
+        return (
+            f"<b>Alfred</b> · idle\n"
+            f"<code>Up {up_str} · {_total_analyses} analyses run</code>"
+        )
+
+    blocks = []
+    for j in sorted(jobs, key=lambda x: x.get("start_time") or 0):
+        pct    = j.get("progress", 0.0)
+        bar    = _build_progress_bar(pct)
+        status = j.get("status", "—")
+        past   = int(time.time() - j["start_time"]) if j.get("start_time") else 0
+        pm, ps = divmod(past, 60)
+        elapsed = f"{pm}m {ps}s" if pm else f"{ps}s"
+
+        speed = j.get("speed", "")
+        eta   = j.get("eta", "")
+        pace  = ""
+        if speed and speed not in ("0 B/s", ""):
+            pace = f" · {speed}"
+            if eta and eta not in ("-", ""):
+                pace += f" · ETA {eta}"
+
+        name = j.get("username", "?")
+        jid  = j["job_id"]
+        jtype = j.get("type", "?")
+
+        if past:
+            foot = f"╰ {elapsed} · /c_{jid}"
+        else:
+            foot = f"╰ /c_{jid}"
+
+        blocks.append(
+            f"╭ <b>#{jtype}</b> <code>{jid}</code> · @{name}\n"
+            f"┊ [{bar}] {pct:.0f}%\n"
+            f"┊ {status}{pace}\n"
+            f"{foot}"
+        )
+
+    return "\n\n".join(blocks)
+
+async def _board_loop():
+    """Background task: re-renders and edits all live boards every 3 s."""
+    while True:
+        await asyncio.sleep(3)
+        for key, board in list(_boards.items()):
+            chat_id, _ = key
+            text = _render_board(chat_id, _)
+            if text == board.get("last_text"):
+                continue
+            try:
+                await app.edit_message_text(chat_id, board["msg_id"], text, parse_mode=ParseMode.HTML)
+                board["last_text"] = text
+            except Exception:
+                pass
+
+# ---------------------------------------------------------------------------
 # Universal Queue Dispatcher
 # ---------------------------------------------------------------------------
 async def enqueue_universal_task(job: dict, ctx):
     user_id = job["user_id"]
     if _user_queue_counts[user_id] >= MAX_QUEUE_PER_USER:
-        msg = f"⏳ **You have reached the maximum queue limit ({MAX_QUEUE_PER_USER}). Please wait for a slot.**"
+        msg = f"⏳ You have reached the maximum queue limit ({MAX_QUEUE_PER_USER}). Please wait for a slot."
         if isinstance(ctx, CallbackQuery):
             await safe_edit(ctx.message, msg)
         else:
@@ -334,37 +407,61 @@ async def enqueue_universal_task(job: dict, ctx):
         return
 
     _user_queue_counts[user_id] += 1
-    
+
     job_id = uuid.uuid4().hex[:6]
     job["job_id"] = job_id
-    
+
+    # Resolve chat context from either a Message or a CallbackQuery
+    if isinstance(ctx, CallbackQuery):
+        chat_id   = ctx.message.chat.id
+        thread_id = ctx.message.message_thread_id or 0
+    else:
+        chat_id   = ctx.chat.id
+        thread_id = ctx.message_thread_id or 0
+
     username = getattr(ctx.from_user, "username", None) or getattr(ctx.from_user, "first_name", "Unknown")
     _active_jobs[job_id] = {
-        "job_id": job_id,
-        "user_id": user_id,
-        "username": username,
-        "type": job.get("type", "unknown").upper(),
-        "filename": job.get("filename", "Unknown Audio"),
-        "status": "Queued",
-        "progress": 0.0,
-        "speed": "0 B/s",
-        "eta": "-",
-        "downloaded": "0 B",
-        "total": "0 B",
+        "job_id":    job_id,
+        "user_id":   user_id,
+        "username":  username,
+        "chat_id":   chat_id,
+        "thread_id": thread_id,
+        "type":      job.get("type", "unknown").upper(),
+        "filename":  job.get("filename", "Unknown Audio"),
+        "status":    "Queued",
+        "progress":  0.0,
+        "speed":     "0 B/s",
+        "eta":       "-",
+        "downloaded":"0 B",
+        "total":     "0 B",
         "start_time": 0.0,
-        "async_task": None
+        "async_task": None,
     }
-    
-    queue_pos = _task_queue.qsize()
-    text = f"✅ Queued. Position: <b>{queue_pos + 1}</b>.\n⋗ Stop: /c_{job_id}"
-    
-    if isinstance(ctx, CallbackQuery):
-        await safe_edit(ctx.message, text, parse_mode=ParseMode.HTML)
-        status_msg = ctx.message
-    else:
-        status_msg = await ctx.reply(text, parse_mode=ParseMode.HTML, quote=True)
 
-    job["status_msg"] = status_msg
+    # Create or refresh the live board for this (chat, thread)
+    key        = (chat_id, thread_id)
+    board_text = _render_board(chat_id, thread_id)
+
+    async def _make_board_msg():
+        if isinstance(ctx, CallbackQuery):
+            return await app.send_message(
+                chat_id, board_text,
+                message_thread_id=thread_id or None,
+                parse_mode=ParseMode.HTML,
+            )
+        return await ctx.reply(board_text, parse_mode=ParseMode.HTML, quote=True)
+
+    if key in _boards:
+        try:
+            await app.edit_message_text(chat_id, _boards[key]["msg_id"], board_text, parse_mode=ParseMode.HTML)
+            _boards[key]["last_text"] = board_text
+        except Exception:
+            board_msg = await _make_board_msg()
+            _boards[key] = {"msg_id": board_msg.id, "last_text": board_text}
+    else:
+        board_msg = await _make_board_msg()
+        _boards[key] = {"msg_id": board_msg.id, "last_text": board_text}
+
     job["client"] = getattr(ctx, "_client", app)
     await _task_queue.put(job)
 
@@ -376,31 +473,48 @@ async def _queue_worker():
     while True:
         job = await _task_queue.get()
         job_id = job["job_id"]
-        
-        # Fast exit if cancelled during wait time
+
+        # Bail if the job was cancelled while sitting in queue
         if job_id not in _active_jobs or _active_jobs[job_id]["status"] == "Cancelled":
             _user_queue_counts[job["user_id"]] -= 1
             if _user_queue_counts[job["user_id"]] <= 0:
                 del _user_queue_counts[job["user_id"]]
             _task_queue.task_done()
             continue
-            
-        _active_jobs[job_id]["status"] = "Preparing..."
+
+        _active_jobs[job_id]["status"]     = "Preparing..."
         _active_jobs[job_id]["start_time"] = time.time()
-        
-        run_task = None
-        job_type = job.get("type")
-        
-        if job_type == "fs":
-            job["payload"]["job_id"] = job_id
-            run_task = asyncio.create_task(_run_forensic_job(job["payload"]))
-        elif job_type == "cnv":
-            import convert
-            run_task = asyncio.create_task(convert._run_convert_job(job))
-        elif job_type == "cue":
-            import cue_split
-            run_task = asyncio.create_task(cue_split._run_cue_job(job))
-            
+
+        run_task  = None
+        job_type  = job.get("type")
+        # per-job status message created here so the board can stay as the queue view
+        per_job_msg = None
+
+        try:
+            if job_type == "fs":
+                orig_msg    = job["payload"]["message"]
+                per_job_msg = await orig_msg.reply("📥 <b>Preparing...</b>", parse_mode=ParseMode.HTML, quote=True)
+                job["payload"]["status_msg"] = per_job_msg
+                job["payload"]["job_id"]     = job_id
+                run_task = asyncio.create_task(_run_forensic_job(job["payload"]))
+
+            elif job_type == "cnv":
+                import convert
+                source_msg  = job["session"]["source_msg"]
+                per_job_msg = await source_msg.reply("⚙️ <b>Preparing conversion...</b>", parse_mode=ParseMode.HTML, quote=True)
+                job["status_msg"] = per_job_msg
+                run_task = asyncio.create_task(convert._run_convert_job(job))
+
+            elif job_type == "cue":
+                import cue_split
+                audio_msg   = job["state"]["audio_msg"]
+                per_job_msg = await audio_msg.reply("⚙️ <b>Preparing split...</b>", parse_mode=ParseMode.HTML, quote=True)
+                job["status_msg"] = per_job_msg
+                run_task = asyncio.create_task(cue_split._run_cue_job(job))
+
+        except Exception:
+            logger.exception("Queue worker: failed to create per-job status message")
+
         if run_task:
             _active_jobs[job_id]["async_task"] = run_task
             try:
@@ -408,20 +522,38 @@ async def _queue_worker():
                 _total_analyses += 1
             except asyncio.CancelledError:
                 logger.info(f"Task {job_id} natively aborted.")
-                try:
-                    await job["status_msg"].edit_text(f"🛑 <b>Task Cancelled.</b> <code>{job_id}</code>", parse_mode=ParseMode.HTML)
-                except Exception:
-                    pass
+                sm = per_job_msg or job.get("status_msg")
+                if sm:
+                    try:
+                        await sm.edit_text(f"🛑 <b>Task cancelled.</b> <code>{job_id}</code>", parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
             except Exception:
                 logger.exception("Queue worker: unhandled error in job")
-        
+
+        # Tear down the job entry and optionally remove the board if the chat is now idle
+        job_chat_id   = _active_jobs.get(job_id, {}).get("chat_id")
+        job_thread_id = _active_jobs.get(job_id, {}).get("thread_id", 0)
+
         user_id = job["user_id"]
         _user_queue_counts[user_id] -= 1
         if _user_queue_counts[user_id] <= 0:
             del _user_queue_counts[user_id]
-        
+
         _active_jobs.pop(job_id, None)
         _task_queue.task_done()
+
+        # If nothing else is running or queued in this chat, remove the board
+        if job_chat_id:
+            remaining = [j for j in _active_jobs.values() if j.get("chat_id") == job_chat_id]
+            if not remaining:
+                key = (job_chat_id, job_thread_id)
+                if key in _boards:
+                    try:
+                        await app.delete_messages(job_chat_id, _boards[key]["msg_id"])
+                    except Exception:
+                        pass
+                    del _boards[key]
 
 async def _run_forensic_job(job: dict):
     """Execute a single /fs analysis job from the queue."""
@@ -688,43 +820,25 @@ async def pong_command(client: Client, message: Message):
 # ---------------------------------------------------------------------------
 # /stats
 # ---------------------------------------------------------------------------
-def _build_progress_bar(percent: float, length: int = 15) -> str:
-    filled = int(round((percent / 100.0) * length))
-    empty = length - filled
-    return "⬤" * filled + "○" * empty
-
 @app.on_message(filters.command("stats"))
 async def stats_command(client: Client, message: Message):
-    uptime_sec = int(time.monotonic() - _start_time)
-    h, rem     = divmod(uptime_sec, 3600)
-    m, s       = divmod(rem, 60)
-    
-    out = []
-    for jid, st in _active_jobs.items():
-        if not st.get("async_task"): continue
-        pct = st["progress"]
-        bar = _build_progress_bar(pct)
-        passed = int(time.time() - st["start_time"])
-        pm, ps = divmod(passed, 60)
-        ph, pm = divmod(pm, 60)
-        past_str = f"{ph}h{pm}m{ps}s" if ph else f"{pm}m{ps}s"
-        
-        block = (
-            f"╭ <b>Task By {st['username']}</b>\n"
-            f"┊ [{bar}] {pct:.1f}%\n"
-            f"┊ Status   : {st['status']}\n"
-            f"┊ Done     : {st['downloaded']}\n"
-            f"┊ Total    : {st['total']}\n"
-            f"┊ Speed    : {st['speed']}\n"
-            f"┊ ETA      : {st['eta']}\n"
-            f"┊ Past     : {past_str}\n"
-            f"╰ Mode     : #{st['type']}\n"
-            f"⋗ Stop : /c_{jid}\n"
-        )
-        out.append(block)
-    
-    jobs_str = "\n".join(out) if out else "<i>No active tasks.</i>\n"
-    await message.reply(f"{jobs_str}")
+    chat_id   = message.chat.id
+    thread_id = message.message_thread_id or 0
+    key       = (chat_id, thread_id)
+    text      = _render_board(chat_id, thread_id)
+
+    if key in _boards:
+        # Relocate: resend first so there's no blank gap, then delete the old one
+        new_msg = await message.reply(text, parse_mode=ParseMode.HTML, quote=True)
+        old_id  = _boards[key]["msg_id"]
+        _boards[key] = {"msg_id": new_msg.id, "last_text": text}
+        try:
+            await app.delete_messages(chat_id, old_id)
+        except Exception:
+            pass
+    else:
+        new_msg = await message.reply(text, parse_mode=ParseMode.HTML, quote=True)
+        _boards[key] = {"msg_id": new_msg.id, "last_text": text}
 
 @app.on_message(filters.regex(r"^/c_(.+)$") | filters.regex(r"^/cancel_(.+)$"))
 async def cancel_command(client: Client, message: Message):
@@ -870,12 +984,14 @@ async def _on_start():
     async with app:
         logger.info("Alfred (MTProto) is now online and standing by.")
 
-        workers = [asyncio.create_task(_queue_worker()) for _ in range(MAX_CONCURRENT_JOBS)]
+        workers    = [asyncio.create_task(_queue_worker()) for _ in range(MAX_CONCURRENT_JOBS)]
+        board_task = asyncio.create_task(_board_loop())
         try:
             await idle()
         finally:
             for w in workers:
                 w.cancel()
+            board_task.cancel()
 
 if __name__ == "__main__":
     if not BOT_TOKEN or not API_ID or not API_HASH:

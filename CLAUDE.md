@@ -53,12 +53,16 @@ Key invariants when touching the queue path:
 Each owns its own conversational state and exposes async handlers that `bot.py` wires to Pyrogram decorators. They return a **job dict** (or `None`); `bot.py` enqueues whatever dict comes back.
 
 - **`af2.py`** — the forensic engine. Dataclass report model (`ForensicReport` → `AudioTags`, `AudioTechnical`, `LoudnessProfile`, `AuthenticityReport`, `SpectralAnalysis`). `build_report()` orchestrates extractors that shell out to mediainfo (tags/technical), sox `stat` (acoustic measurements), and ffmpeg filters (`astats`, `ebur128`, `drmeter`, `aphasemeter`, `silencedetect`). The `SpectralEngine` class decodes audio to a numpy float array via ffmpeg pipe and runs an FFT-based **scoring system**: it accumulates a `lossy_score` and a `natural_score` from independent heuristics (HF cutoff, cliff sharpness, banding, side-channel anomaly, noise floor above cutoff, entropy, DSD detection), nets them, and maps the net to a verdict label. `make_telegraph_content` in `bot.py` and `print_report`/`print_batch_summary` in `af2.py` are two separate renderers over the same `ForensicReport`.
+- **`/log` (inline in `bot.py`)** — EAC/XLD rip log checker. Replies to a `.log` document, POSTs it to `https://logcheck.nirzak.win/api` (multipart `logfile` field) via httpx, and formats the JSON response (`score`, `ripper`, `ripper_version`, `checksum_state`, `details[]`). Intentionally not queued — no heavy processing.
 - **`convert.py`** — interactive transcode wizard. Inline-keyboard callback data is positional and colon-delimited: `cv:{chat_id}:{msg_id}:{format}:{mode}:{grade}` (see the module docstring). State keyed in `_convert_sessions`. `_build_ffmpeg_args` maps (format, mode, grade, samplerate) → ffmpeg flags; `_transfer_tags` copies metadata across via mutagen.
 - **`cue_split.py`** — CUE-sheet album splitter implemented as a **per-user state machine** in `CUE_WAITING_LIST` (`user_id → state`). Flow: `/cue` on an audio reply kicks off a background download immediately, then the bot prompts for a `.cue` file and optional cover art via follow-up document uploads. The `cue_interceptor` handler in `bot.py` (`filters.document | filters.photo`) catches those uploads and feeds them to `check_and_process_cue_upload`, which advances the state machine and eventually returns the split job.
 
 ### Auth gate
 
-`_check_auth(message)` runs at the top of every privileged command. `ADMIN_IDS` bypass all checks; everyone else must be in an allowed (chat, topic) pair. Telegram supergroup **topic threads** matter throughout — replies must route back to `message_thread_id`, which is why the code uses native `message.reply*` wrappers rather than raw `client.send_*` (regressing this breaks topic routing, per git history).
+`_check_auth(message)` runs at the top of every privileged command. `ADMIN_IDS` bypass all checks; everyone else must be in an allowed (chat, topic) pair. Telegram supergroup **topic threads** matter throughout — but the rule is precise:
+
+- **`client.send_*(chat_id=..., message_thread_id=thread_id, ...)`** — must pass `message_thread_id` explicitly, no implicit context.
+- **`message.reply_*(...)` / `message.reply_audio(...)` etc.** — must NOT pass `message_thread_id`. Pyrogram derives the thread from the reply anchor automatically, and the kwarg is not accepted by these methods (raises `TypeError` at runtime).
 
 ## Conventions worth matching
 

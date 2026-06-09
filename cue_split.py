@@ -181,13 +181,11 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
             with open(local_cue_path, "wb") as f:
                 f.write(cue_io.getbuffer())
 
-        # Clean up prompts
-        await client.delete_messages(state["chat_id"], [state["prompt_msg_id"]])
-        await client.delete_messages(message.chat.id, [message.id])
-
+        old_prompt_id     = state["prompt_msg_id"]
         state["cue_path"] = local_cue_path
         state["status"]   = "waiting_art"
 
+        # Send art prompt immediately — user sees next step before cleanup runs
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("Skip Album Art ⏩", callback_data=f"cuesplit_skip_{user_id}")
         ]])
@@ -200,6 +198,10 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
             reply_to_message_id  = state["audio_msg"].id,
         )
         state["prompt_msg_id"] = art_prompt.id
+
+        # Clean up old prompt and user's CUE message after new prompt is visible
+        await client.delete_messages(state["chat_id"], [old_prompt_id])
+        await client.delete_messages(message.chat.id, [message.id])
         return True
 
     # ── STATE 2: waiting for album art ──
@@ -275,12 +277,24 @@ async def handle_cuesplit_callback(client: Client, query: CallbackQuery):
 # ---------------------------------------------------------------------------
 # Core splitting pipeline
 # ---------------------------------------------------------------------------
+def _set_status(job_id: str, status: str, progress: float = None):
+    try:
+        if job_id and "bot" in sys.modules:
+            entry = sys.modules["bot"]._active_jobs.get(job_id)
+            if entry:
+                entry["status"] = status
+                if progress is not None:
+                    entry["progress"] = progress
+    except Exception:
+        pass
+
 async def _run_cue_job(job: dict):
     client         = job["client"]
     ctx            = job["ctx"]
     user_id        = job["user_id"]
     data           = job["state"]
     status_msg     = job["status_msg"]
+    job_id         = job.get("job_id")
 
     audio_msg      = data["audio_msg"]
     download_task  = data["download_task"]
@@ -301,6 +315,7 @@ async def _run_cue_job(job: dict):
         return
 
     await safe_edit(status_msg, "⚙️ <b>Processing CUE and Audio...</b>", parse_mode=ParseMode.HTML)
+    _set_status(job_id, "Processing CUE and Audio...")
     local_thumb    = None
 
     try:
@@ -316,6 +331,7 @@ async def _run_cue_job(job: dict):
             parse_mode          = ParseMode.HTML,
             reply_to_message_id = audio_msg.id,
         )
+        _set_status(job_id, "Waiting for audio download...")
 
         # ── Await the background download (already started) ──
         download_ok = await download_task
@@ -330,6 +346,7 @@ async def _run_cue_job(job: dict):
 
         # ── Parse CUE ──
         await safe_edit(status_msg, "⚙️ <b>Parsing CUE metadata...</b>", parse_mode=ParseMode.HTML)
+        _set_status(job_id, "Parsing CUE metadata...")
         cue_data    = _parse_cue_data(cue_path)
         tracks      = cue_data["tracks"]
         global_meta = cue_data["meta"]
@@ -364,6 +381,7 @@ async def _run_cue_job(job: dict):
                     f"🔪 <b>Splitting</b> track {track_num}/{total_tracks}...",
                     parse_mode=ParseMode.HTML
                 )
+                _set_status(job_id, f"Splitting track {track_num}/{total_tracks}", progress=(track_num / total_tracks) * 50)
             except Exception:
                 pass
 
@@ -407,6 +425,7 @@ async def _run_cue_job(job: dict):
             f"📤 <b>Uploading {len(split_files)} tracks...</b>",
             parse_mode=ParseMode.HTML
         )
+        _set_status(job_id, f"Uploading {len(split_files)} tracks...", progress=50)
 
         for i, fp in enumerate(split_files):
             try:
@@ -414,6 +433,7 @@ async def _run_cue_job(job: dict):
                 trk         = tracks[i] if i < len(tracks) else {}
                 trk_title   = trk.get("title", os.path.splitext(os.path.basename(fp))[0])
                 trk_artist  = trk.get("performer", global_meta.get("album_artist", ""))
+                _set_status(job_id, f"Uploading track {i+1}/{len(split_files)}", progress=50 + ((i + 1) / len(split_files)) * 50)
 
                 await audio_msg.reply_audio(
                     audio               = fp,
