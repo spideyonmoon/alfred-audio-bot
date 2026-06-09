@@ -134,7 +134,7 @@ async def handle_cuesplit_command(client: Client, message: Message):
         "thread_id":       message.message_thread_id,
         "prompt_msg_id":   prompt.id,
         "work_dir":        work_dir,
-        "cue_path":        None,
+        "cue_msg":         None,   # set when .cue arrives; downloaded inside the job
         "cover_path":      None,
         "dl_job_id":       dl_job_id,
     }
@@ -172,20 +172,11 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
         if not doc or not doc.file_name.lower().endswith(".cue"):
             return False
 
-        work_dir       = state["work_dir"]
-        local_cue_path = os.path.join(work_dir, "input.cue")
+        old_prompt_id    = state["prompt_msg_id"]
+        state["cue_msg"] = message   # download deferred to the job runner
+        state["status"]  = "waiting_art"
 
-        # Download CUE in-memory to avoid Pyrogram tiny-file shutil.move bug
-        cue_io = await client.download_media(message, in_memory=True)
-        if cue_io:
-            with open(local_cue_path, "wb") as f:
-                f.write(cue_io.getbuffer())
-
-        old_prompt_id     = state["prompt_msg_id"]
-        state["cue_path"] = local_cue_path
-        state["status"]   = "waiting_art"
-
-        # Send art prompt immediately — user sees next step before cleanup runs
+        # Send art prompt BEFORE any I/O so the user sees the next step immediately
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("Skip Album Art ⏩", callback_data=f"cuesplit_skip_{user_id}")
         ]])
@@ -199,7 +190,6 @@ async def check_and_process_cue_upload(client: Client, message: Message) -> bool
         )
         state["prompt_msg_id"] = art_prompt.id
 
-        # Clean up old prompt and user's CUE message after new prompt is visible
         await client.delete_messages(state["chat_id"], [old_prompt_id])
         await client.delete_messages(message.chat.id, [message.id])
         return True
@@ -289,113 +279,87 @@ def _set_status(job_id: str, status: str, progress: float = None):
         pass
 
 async def _run_cue_job(job: dict):
-    client         = job["client"]
-    ctx            = job["ctx"]
-    user_id        = job["user_id"]
-    data           = job["state"]
-    status_msg     = job["status_msg"]
-    job_id         = job.get("job_id")
+    client    = job["client"]
+    user_id   = job["user_id"]
+    data      = job["state"]
+    job_id    = job.get("job_id")
 
-    audio_msg      = data["audio_msg"]
-    download_task  = data["download_task"]
-    audio_path     = data["audio_path"]
-    cue_path       = data["cue_path"]
-    cover_path     = data["cover_path"]
-    work_dir       = data["work_dir"]
-    chat_id        = data["chat_id"]
-    thread_id      = data["thread_id"]
-    prompt_msg_id  = data.get("prompt_msg_id")
-    art_msg_id     = data.get("art_msg_id")
+    audio_msg     = data["audio_msg"]
+    download_task = data["download_task"]
+    audio_path    = data["audio_path"]
+    cue_msg       = data.get("cue_msg")
+    cover_path    = data["cover_path"]
+    work_dir      = data["work_dir"]
+    chat_id       = data["chat_id"]
+    prompt_msg_id = data.get("prompt_msg_id")
+    art_msg_id    = data.get("art_msg_id")
 
     output_dir = os.path.join(work_dir, "split")
     os.makedirs(output_dir, exist_ok=True)
 
-    if not status_msg:
-        logging.error("CUE missing dynamic status_msg element.")
-        return
-
-    await safe_edit(status_msg, "⚙️ <b>Processing CUE and Audio...</b>", parse_mode=ParseMode.HTML)
-    _set_status(job_id, "Processing CUE and Audio...")
-    local_thumb    = None
+    _set_status(job_id, "Processing...")
+    local_thumb = None
 
     try:
         # Clean up lingering prompts
-        to_delete = [m for m in [prompt_msg_id, art_msg_id] if m]
-        for m_id in to_delete:
+        for m_id in [m for m in [prompt_msg_id, art_msg_id] if m]:
             await client.delete_messages(chat_id, [m_id])
 
-        status_msg = await client.send_message(
-            chat_id             = chat_id,
-            message_thread_id   = thread_id,
-            text                = "⏳ <b>Waiting for download to complete...</b>",
-            parse_mode          = ParseMode.HTML,
-            reply_to_message_id = audio_msg.id,
-        )
-        _set_status(job_id, "Waiting for audio download...")
+        # Download the .cue file (deferred so the art prompt showed instantly)
+        local_cue_path = os.path.join(work_dir, "input.cue")
+        if cue_msg:
+            cue_io = await client.download_media(cue_msg, in_memory=True)
+            if cue_io:
+                with open(local_cue_path, "wb") as f:
+                    f.write(cue_io.getbuffer())
 
-        # ── Await the background download (already started) ──
+        _set_status(job_id, "Waiting for audio download...")
         download_ok = await download_task
         if not download_ok or not os.path.exists(audio_path):
-            await safe_edit(status_msg, "❌ Audio download failed.")
+            await audio_msg.reply_text("❌ Audio download failed.", quote=True)
             return
 
-        # Thumbnail for Telegram audio messages
         if cover_path and os.path.exists(cover_path):
             local_thumb = os.path.join(work_dir, "thumbnail.jpg")
             await _generate_thumbnail(cover_path, local_thumb)
 
-        # ── Parse CUE ──
-        await safe_edit(status_msg, "⚙️ <b>Parsing CUE metadata...</b>", parse_mode=ParseMode.HTML)
-        _set_status(job_id, "Parsing CUE metadata...")
-        cue_data    = _parse_cue_data(cue_path)
+        _set_status(job_id, "Parsing CUE...")
+        cue_data    = _parse_cue_data(local_cue_path)
         tracks      = cue_data["tracks"]
         global_meta = cue_data["meta"]
 
         if not tracks:
-            await safe_edit(status_msg, "❌ No TRACK entries found in the CUE file.")
+            await audio_msg.reply_text("❌ No TRACK entries found in the CUE file.", quote=True)
             return
 
-        # ── Split ──
         total_tracks   = len(tracks)
         audio_filename = os.path.basename(audio_path)
         ext            = os.path.splitext(audio_filename)[1].lower()
 
-        # Format normalization
         if ext in (".wv", ".ape"):
             ext = ".flac"
         elif ext == ".alac":
             ext = ".m4a"
 
         for i, track in enumerate(tracks):
-            track_num = i + 1
-            title     = track.get("title", f"Track {track_num}")
+            track_num  = i + 1
+            title      = track.get("title", f"Track {track_num}")
             safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
             out_file   = os.path.join(output_dir, f"{track_num:02d} - {safe_title}{ext}")
 
             start_sec = track["start"]
             end_sec   = tracks[i + 1]["start"] if (i + 1 < len(tracks)) else None
 
-            try:
-                await safe_edit(
-                    status_msg,
-                    f"🔪 <b>Splitting</b> track {track_num}/{total_tracks}...",
-                    parse_mode=ParseMode.HTML
-                )
-                _set_status(job_id, f"Splitting track {track_num}/{total_tracks}", progress=(track_num / total_tracks) * 50)
-            except Exception:
-                pass
+            _set_status(job_id, f"Splitting {track_num}/{total_tracks}", progress=(track_num / total_tracks) * 50)
 
             cmd = ["ffmpeg", "-y", "-i", audio_path, "-ss", str(start_sec)]
             if end_sec is not None:
                 cmd += ["-to", str(end_sec)]
-            if ext == ".flac":
-                cmd += ["-c:a", "flac"]
-            else:
-                cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+            cmd += (["-c:a", "flac"] if ext == ".flac" else ["-c", "copy", "-avoid_negative_ts", "make_zero"])
             cmd += ["-map_metadata", "-1", out_file]
 
             try:
-                retcode, stderr = await run_async_subprocess(cmd)
+                retcode, _ = await run_async_subprocess(cmd)
             except Exception as e:
                 logger.warning("CUE FFmpeg subprocess fault: %r", e)
                 retcode = 1
@@ -414,50 +378,43 @@ async def _run_cue_job(job: dict):
             else:
                 logger.warning("FFmpeg non-zero on track %d", track_num)
 
-        # ── Upload ──
         split_files = sorted(glob.glob(os.path.join(output_dir, "*")))
         if not split_files:
-            await safe_edit(status_msg, "❌ Splitting finished but no output files were found.")
+            await audio_msg.reply_text("❌ Splitting finished but no output files were found.", quote=True)
             return
 
-        await safe_edit(
-            status_msg,
-            f"📤 <b>Uploading {len(split_files)} tracks...</b>",
-            parse_mode=ParseMode.HTML
-        )
-        _set_status(job_id, f"Uploading {len(split_files)} tracks...", progress=50)
+        _set_status(job_id, f"Uploading {len(split_files)} tracks", progress=50)
 
         for i, fp in enumerate(split_files):
             try:
-                duration    = await _get_duration(fp)
-                trk         = tracks[i] if i < len(tracks) else {}
-                trk_title   = trk.get("title", os.path.splitext(os.path.basename(fp))[0])
-                trk_artist  = trk.get("performer", global_meta.get("album_artist", ""))
-                _set_status(job_id, f"Uploading track {i+1}/{len(split_files)}", progress=50 + ((i + 1) / len(split_files)) * 50)
+                duration   = await _get_duration(fp)
+                trk        = tracks[i] if i < len(tracks) else {}
+                trk_title  = trk.get("title", os.path.splitext(os.path.basename(fp))[0])
+                trk_artist = trk.get("performer", global_meta.get("album_artist", ""))
+                _set_status(job_id, f"Uploading {i+1}/{len(split_files)}", progress=50 + ((i + 1) / len(split_files)) * 50)
 
                 await audio_msg.reply_audio(
-                    audio               = fp,
-                    title               = trk_title,
-                    performer           = trk_artist,
-                    thumb               = local_thumb if local_thumb and os.path.exists(local_thumb) else None,
-                    duration            = duration,
-                    quote               = True,
+                    audio     = fp,
+                    title     = trk_title,
+                    performer = trk_artist,
+                    thumb     = local_thumb if local_thumb and os.path.exists(local_thumb) else None,
+                    duration  = duration,
+                    quote     = True,
                 )
                 await asyncio.sleep(1.5)
             except Exception as e:
                 logger.error("Upload error for %s: %r", fp, e)
 
-        await client.delete_messages(chat_id, [status_msg.id])
         await audio_msg.reply_text(
-            text                = f"✅ <b>Done!</b> {total_tracks} tracks split and uploaded.",
-            parse_mode          = ParseMode.HTML,
-            quote               = True,
+            f"✅ <b>Done!</b> {total_tracks} tracks split and uploaded.",
+            parse_mode=ParseMode.HTML,
+            quote=True,
         )
 
     except Exception:
         logger.exception("CUE splitting critical error")
         try:
-            await safe_edit(status_msg, "❌ <b>Critical error during splitting.</b>", parse_mode=ParseMode.HTML)
+            await audio_msg.reply_text("❌ <b>Critical error during splitting.</b>", parse_mode=ParseMode.HTML, quote=True)
         except Exception:
             pass
     finally:

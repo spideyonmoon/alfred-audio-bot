@@ -507,9 +507,6 @@ async def _queue_worker():
 
             elif job_type == "cue":
                 import cue_split
-                audio_msg   = job["state"]["audio_msg"]
-                per_job_msg = await audio_msg.reply("⚙️ <b>Preparing split...</b>", parse_mode=ParseMode.HTML, quote=True)
-                job["status_msg"] = per_job_msg
                 run_task = asyncio.create_task(cue_split._run_cue_job(job))
 
         except Exception:
