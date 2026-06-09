@@ -837,7 +837,7 @@ async def stats_command(client: Client, message: Message):
         new_msg = await message.reply(text, parse_mode=ParseMode.HTML, quote=True)
         _boards[key] = {"msg_id": new_msg.id, "last_text": text}
 
-@app.on_message(filters.regex(r"^/c_(.+)$") | filters.regex(r"^/cancel_(.+)$"))
+@app.on_message(filters.regex(r"^/(?:c|cancel)_([a-f0-9]{6})(?:@\S+)?$"))
 async def cancel_command(client: Client, message: Message):
     job_id = message.matches[0].group(1)
     if job_id not in _active_jobs:
