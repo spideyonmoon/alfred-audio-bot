@@ -68,7 +68,11 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    parse_mode=ParseMode.HTML
+    parse_mode=ParseMode.HTML,
+    # Auto-sleep through FloodWaits up to this many seconds instead of raising.
+    # Default is 10s; we routinely see 11s waits on SendMedia/EditMessage that
+    # would otherwise abort an already-completed job (e.g. uploading a converted file).
+    sleep_threshold=60,
 )
 
 # ---------------------------------------------------------------------------
