@@ -3,5 +3,6 @@ TgCrypto
 httpx
 python-dotenv
 numpy
+scipy
 mutagen
 psutil

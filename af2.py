@@ -543,7 +543,6 @@ def generate_spectrogram(filepath: Path) -> Path:
              "-x", "1280",   # width in pixels
              "-y", "513",    # height in pixels (2^n + 1 -> fast DFT path in SoX)
              "-z", "120",    # dynamic range in dB
-             "-Z", "-20",    # clip ceiling at −20 dB (removes whitewash)
              "-t", filepath.stem,
              "-o", str(output)],
             input=decode.stdout, capture_output=True, check=False)
