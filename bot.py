@@ -269,14 +269,23 @@ def make_telegraph_content(report: ForensicReport, include_assessment: bool = Tr
         verdict_lines = []
         bd_text = auth.bit_depth_authentic
         if bd_text and "padded" in bd_text.lower():
-            bd_text += " [⚠ Note: SoX heuristics for container padding are experimental.]"
-        verdict_lines.extend(add_line("Bit-Depth Auth [SoX]: ", bd_text))
+            bd_text += " [⚠ Note: container padding detected via trailing-zero analysis.]"
+        verdict_lines.extend(add_line("Bit-Depth Auth: ",   bd_text))
 
         if auth.phase_correlation and auth.phase_correlation != "N/A":
-            verdict_lines.extend(add_line("Phase Corr [FFmpeg aphasemeter]: ",
+            verdict_lines.extend(add_line("Phase Correlation: ",
                                           f"{auth.phase_correlation} [{auth.phase_verdict}]"))
-        verdict_lines.extend(add_line("Clipping [FFmpeg astats]: ",       auth.clipping_verdict))
-        verdict_lines.extend(add_line("Silence [FFmpeg silencedetect]: ", auth.silence_total_pct))
+        verdict_lines.extend(add_line("Side Channel: ",     auth.side_channel_analysis))
+        verdict_lines.extend(add_line("Clipping: ",         auth.clipping_verdict))
+        verdict_lines.extend(add_line("Silence: ",          auth.silence_total_pct))
+        verdict_lines.extend(add_line("Header Integrity: ", auth.header_integrity))
+        if auth.encoder_trace:
+            verdict_lines.extend(add_line("Encoder Trace: ", auth.encoder_trace))
+        if auth.cassette_rip_detected or auth.vinyl_rip_detected:
+            sources = []
+            if auth.cassette_rip_detected: sources.append("cassette tape")
+            if auth.vinyl_rip_detected:    sources.append("vinyl")
+            verdict_lines.extend(add_line("Analog Source: ", " + ".join(sources) + " signature detected"))
 
         if auth.rg_stored:
             verdict_lines.extend(add_line("RG Tag (stored): ", auth.rg_stored))
@@ -286,19 +295,62 @@ def make_telegraph_content(report: ForensicReport, include_assessment: bool = Tr
         if sp and sp.verdict_label != "INCONCLUSIVE":
             verdict_lines.extend([br(), b("── Spectral Engine Verdict [Numpy FFT] ──"), br()])
             verdict_lines.extend(add_line("Conclusion: ", sp.primary_verdict))
-            verdict_lines.extend(add_line("Algorithm Score: ",
+            verdict_lines.extend(add_line("Main Score: ",
+                f"{sp.main_score}/100  (0 = pristine · 100 = certain transcode)"))
+            verdict_lines.extend(add_line("Base Engine: ",
                 f"Lossy {sp.lossy_score} − Natural {sp.natural_score} = Net {sp.net_score}/{sp.max_score}"))
-            if getattr(sp, "dsd_detected", False):
+            if sp.dsd_detected:
                 verdict_lines.extend(add_line("Ultrasonic Noise: ", "⚠ DSD/SACD Transcode Profile detected"))
             verdict_lines.extend(add_line("HF Cutoff: ",         sp.cutoff_hz_str))
-            verdict_lines.extend(add_line("Cutoff Variance: ",   f"{sp.cutoff_variance:.1f} Hz² {sp.cutoff_variance_interp}".strip()))
-            verdict_lines.extend(add_line("Cliff Sharpness: ",   f"{sp.cutoff_sharpness_db:.1f} dB/bin {sp.cutoff_sharpness_interp}".strip()))
-            verdict_lines.extend(add_line("HF Energy Ratio: ",   f"{sp.hf_energy_ratio:.5f} {sp.hf_energy_interp}".strip()))
-            verdict_lines.extend(add_line("Side Anomaly: ",      f"{sp.side_anomaly_score:.3f} {sp.side_interp}".strip()))
-            verdict_lines.extend(add_line("Banding Score: ",     f"{sp.banding_score:.3f} {sp.banding_interp}".strip()))
-            verdict_lines.extend(add_line("NF Above Cutoff: ",   f"{sp.nf_above_cutoff_db:.1f} dB {sp.nf_interp}".strip()))
-            verdict_lines.extend(add_line("Low-Pass Filter: ",   "Detected" if sp.lpf_detected else "None detected"))
-            verdict_lines.extend(add_line("Spectral Entropy: ",  f"{sp.entropy:.3f} {sp.entropy_interp}".strip()))
+            verdict_lines.extend(add_line("Cutoff Variance: ",   f"{sp.cutoff_variance:.1f} Hz²  {sp.cutoff_variance_interp}".strip()))
+            verdict_lines.extend(add_line("Cliff Sharpness: ",   f"{sp.cutoff_sharpness_db:.1f} dB/bin  {sp.cutoff_sharpness_interp}".strip()))
+            verdict_lines.extend(add_line("HF Energy Ratio: ",   f"{sp.hf_energy_ratio:.5f}  {sp.hf_energy_interp}".strip()))
+            verdict_lines.extend(add_line("Side Anomaly: ",      f"{sp.side_anomaly_score:.3f}  {sp.side_interp}".strip()))
+            verdict_lines.extend(add_line("Banding Score: ",     f"{sp.banding_score:.3f}  {sp.banding_interp}".strip()))
+            verdict_lines.extend(add_line("NF Above Cutoff: ",   f"{sp.nf_above_cutoff_db:.1f} dB  {sp.nf_interp}".strip()))
+            verdict_lines.extend(add_line("Low-Pass Filter: ",   ("⚠ Detected — " + sp.lpf_cutoff_str) if sp.lpf_detected else "✓ None detected"))
+            verdict_lines.extend(add_line("Spectral Entropy: ",  f"{sp.entropy:.3f}  {sp.entropy_interp}".strip()))
+
+            if sp.scipy_available:
+                verdict_lines.extend([br(), b("── Advanced DSP Forensics [scipy] ──"), br()])
+                fp_text = f"⚠ {sp.codec_fingerprint}" if sp.codec_fingerprint else "✓ no known encoder wall match"
+                verdict_lines.extend(add_line("Codec Fingerprint: ", fp_text))
+                res_text = f"⚠ {sp.resample_detected}" if sp.resample_detected else "✓ no foreign-Nyquist artifacts"
+                verdict_lines.extend(add_line("Resample Check: ", res_text))
+                if sp.segment_walled >= 0:
+                    verdict_lines.extend(add_line("Segment Vote: ",
+                        f"{sp.segment_walled}/{sp.segment_total} clips walled ≤{sp.segment_wall_hz / 1000:.1f} kHz"))
+                if sp.auc_avg_bound_freq > 0:
+                    verdict_lines.extend(add_line("auCDtect Bound: ",
+                        f"{sp.auc_avg_bound_freq:,.0f} Hz avg · {sp.auc_prob_bound_freq:,.0f} Hz mode  {sp.auc_bound_interp}".strip()))
+                if sp.auc_phase_entropy > 0:
+                    verdict_lines.extend(add_line("HF Phase Entropy: ",
+                        f"{sp.auc_phase_entropy:.2f} bits  {sp.auc_phase_interp}".strip()))
+                verdict_lines.extend(add_line("Spectral Sparsity: ",
+                    f"{sp.spectral_sparsity:.3f}  {sp.sparsity_interp}".strip()))
+                if sp.hf_envelope_correlation != 0.0:
+                    verdict_lines.extend(add_line("Ultrasonic Corr.: ",
+                        f"{sp.hf_envelope_correlation:+.2f}  {sp.hf_env_corr_interp}".strip()))
+                if sp.preecho_pct > 0:
+                    verdict_lines.extend(add_line("Pre-Echo: ",
+                        f"{sp.preecho_pct:.1f}% of transients  [MDCT block smearing]"))
+                if sp.aliasing_corr > 0:
+                    verdict_lines.extend(add_line("HF Aliasing Corr.: ",
+                        f"{sp.aliasing_corr:.2f}  [codec filterbank mirroring]"))
+                if sp.mp3_noise_pattern_detected:
+                    verdict_lines.extend(add_line("MP3 Subband Comb: ", "⚠ 689 Hz periodic structure detected"))
+                if sp.silence_ratio >= 0:
+                    verdict_lines.extend(add_line("Silence Dither: ", f"{sp.silence_ratio:.3f}"))
+                if sp.vinyl_noise_detected:
+                    verdict_lines.extend(add_line("Vinyl Source: ",
+                        f"✓ surface noise detected ({sp.vinyl_clicks_per_min:.0f} clicks/min)"))
+                if sp.cassette_score >= 30:
+                    verdict_lines.extend(add_line("Cassette Source: ",
+                        f"✓ tape profile matched (score {sp.cassette_score}/80)"))
+                if sp.segment_map:
+                    verdict_lines.extend([br(), b("Partially Transcoded Regions:"), br()])
+                    for seg_line in sp.segment_map[:6]:
+                        verdict_lines.extend([f"  → {seg_line}", br()])
 
             nodes.append(tag("p", *verdict_lines))
 
