@@ -456,7 +456,7 @@ def _build_ffmpeg_args(fmt: str, mode: str, grade: str, samplerate: str = "defau
             args = ["-c:a", "flac", "-compression_level", "5", "-sample_fmt", sfmt, "-ar", sr_str]
             return "flac", args, f"FLAC {depth}-bit {int(sr_str)//1000}kHz"
         else:
-            lvl = grade if grade.isdigit() else "5"
+            lvl = mode if mode.isdigit() else (grade if grade.isdigit() else "5")
             return "flac", ["-c:a", "flac", "-compression_level", lvl], f"FLAC Level {lvl}"
 
     elif fmt == "alac":
