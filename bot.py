@@ -144,6 +144,34 @@ async def upload_to_telegraph(title: str, content: str) -> Optional[str]:
 def _fmt_stat_key(key: str) -> str:
     return re.sub(r"([A-Z])", r" \1", key).strip().title()
 
+# Executive-summary banner helpers (mirror af2's terminal _print_banner).
+_VERDICT_BANNER = {
+    "GENUINE":        ("✓", "GENUINE"),
+    "LIKELY_GENUINE": ("✓", "LIKELY GENUINE"),
+    "CAUTION":        ("~", "CAUTION"),
+    "SUSPICIOUS":     ("⚠", "SUSPICIOUS"),
+    "LIKELY_LOSSY":   ("✗", "LIKELY LOSSY"),
+}
+
+def _channel_label(ch: str) -> str:
+    ch = (ch or "").strip()
+    return {"1": "Mono", "2": "Stereo"}.get(ch, f"{ch} ch" if ch else "")
+
+def verdict_oneliner(report: ForensicReport) -> str:
+    """Single scannable verdict line, e.g. '✗ LIKELY LOSSY · 95/100'. Empty when
+    the spectral engine produced no usable verdict."""
+    sp = report.authenticity.spectral
+    if not sp or sp.verdict_label in ("", "INCONCLUSIVE"):
+        return ""
+    glyph, label = _VERDICT_BANNER.get(sp.verdict_label, ("·", sp.verdict_label.replace("_", " ")))
+    return f"{glyph} {label} · {sp.main_score}/100"
+
+def _khz_label(sr: str) -> str:
+    try:
+        return f"{float(sr) / 1000:.1f} kHz"
+    except (ValueError, TypeError):
+        return ""
+
 def make_telegraph_content(report: ForensicReport, include_assessment: bool = True) -> str:
     """Compiles the Telegraph DOM. Pass include_assessment=False to skip Alfred's Verdict."""
 
@@ -163,6 +191,41 @@ def make_telegraph_content(report: ForensicReport, include_assessment: bool = Tr
 
     t, tec, lp, auth, sp = report.tags, report.technical, report.loudness, report.authenticity, report.authenticity.spectral
     nodes = []
+
+    # ── 0. EXECUTIVE SUMMARY BANNER ──
+    # The conclusion lands first: verdict, confidence bar, main score, headline
+    # finding, key specs, loudness, and the lossy/natural signal tally.
+    if include_assessment and sp and sp.verdict_label not in ("", "INCONCLUSIVE"):
+        glyph, vlabel = _VERDICT_BANNER.get(sp.verdict_label, ("·", sp.verdict_label.replace("_", " ")))
+        filled = max(0, min(10, int(sp.net_confidence_pct / 10)))
+        conf_bar = "█" * filled + "░" * (10 - filled)
+
+        nodes.append(tag("h3", f"{glyph} VERDICT: {vlabel}"))
+        if sp.primary_verdict:
+            nodes.append(tag("blockquote", sp.primary_verdict))
+
+        banner = []
+        banner += [b("Main Score: "), f"{sp.main_score}/100  {conf_bar}  ({sp.net_confidence_pct:.0f}% confidence)", br()]
+        banner += [i("0 = pristine lossless · 100 = certain transcode"), br()]
+
+        specs = " · ".join(s for s in (
+            tec.sample_encoding, _khz_label(tec.sample_rate), _channel_label(tec.channels),
+            tec.duration, f"{report.file_size_mb:.1f} MB" if report.file_size_mb else "",
+        ) if s)
+        if specs:
+            banner += [b("File: "), specs, br()]
+
+        loud = []
+        if report.dr_score and report.dr_score != "N/A": loud.append(report.dr_score)
+        if lp.lufs_integrated: loud.append(f"{lp.lufs_integrated} LUFS")
+        if lp.true_peak_dbtp:  loud.append(f"{lp.true_peak_dbtp} dBTP")
+        elif lp.peak_db:       loud.append(f"peak {lp.peak_db} dBFS")
+        if loud:
+            banner += [b("Loudness: "), " · ".join(loud), br()]
+
+        banner += [b("Signals: "), f"⚠ {len(sp.evidence)} lossy · ✓ {len(sp.natural_evidence)} natural"]
+        nodes.append(tag("p", *banner))
+        nodes.append({"tag": "hr", "children": []})
 
     nodes.append(tag("p",
         "A brief about the terminologies is available ",
@@ -326,6 +389,11 @@ def make_telegraph_content(report: ForensicReport, include_assessment: bool = Tr
                 if sp.auc_phase_entropy > 0:
                     verdict_lines.extend(add_line("HF Phase Entropy: ",
                         f"{sp.auc_phase_entropy:.2f} bits  {sp.auc_phase_interp}".strip()))
+                # MDCT quantization-error lattice (Derrien, JAES 2019) — the backstop
+                # for full-bandwidth high-bitrate AAC transcodes that leave no lowpass wall.
+                if sp.mdct_quant_score >= 0:
+                    verdict_lines.extend(add_line("MDCT Quant. Lattice: ",
+                        f"{sp.mdct_quant_score:.3f}  {sp.mdct_quant_interp}".strip()))
                 verdict_lines.extend(add_line("Spectral Sparsity: ",
                     f"{sp.spectral_sparsity:.3f}  {sp.sparsity_interp}".strip()))
                 if sp.hf_envelope_correlation != 0.0:
@@ -433,6 +501,12 @@ def _render_board(chat_id: int, thread_id: int) -> str:
         )
 
     return "\n\n".join(blocks)
+
+def _set_job_status(job_id: str, status: str) -> None:
+    """Write a job's live status string into _active_jobs so the shared board
+    renders it. Replaces per-job status messages — the board is the single view."""
+    if job_id and job_id in _active_jobs:
+        _active_jobs[job_id]["status"] = status
 
 async def _board_loop():
     """Background task: re-renders and edits all live boards every 3 s."""
@@ -543,14 +617,15 @@ async def _queue_worker():
 
         run_task  = None
         job_type  = job.get("type")
-        # per-job status message created here so the board can stay as the queue view
+        # per-job status message (cnv only); fs reuses the shared board via _active_jobs
         per_job_msg = None
 
         try:
             if job_type == "fs":
-                orig_msg    = job["payload"]["message"]
-                per_job_msg = await orig_msg.reply("📥 <b>Preparing...</b>", parse_mode=ParseMode.HTML, quote=True)
-                job["payload"]["status_msg"] = per_job_msg
+                # No per-job status message: the live board (rendered from
+                # _active_jobs) is the single status view for forensic jobs,
+                # halving the per-chat edit traffic and FloodWait risk.
+                job["payload"]["status_msg"] = None
                 job["payload"]["job_id"]     = job_id
                 run_task = asyncio.create_task(_run_forensic_job(job["payload"]))
 
@@ -625,17 +700,19 @@ async def _run_forensic_job(job: dict):
     user_id   = message.from_user.id
     username  = message.from_user.username or message.from_user.first_name
 
+    job_id = job.get("job_id")
+
     file_size_mb = getattr(file_obj, "file_size", 0) / (1024 * 1024)
     if file_size_mb > MAX_FILE_SIZE_MB:
         await message.reply(f"❌ File exceeds the MTProto limit of <b>{MAX_FILE_SIZE_MB} MB</b>.")
         return
 
-    status_msg = job.get("status_msg")
-    if status_msg:
-        await safe_edit(status_msg, "📥 <b>Downloading...</b>", parse_mode=ParseMode.HTML)
-    else:
-        status_msg = await message.reply("📥 <b>Downloading...</b>", quote=True)
-        
+    # No per-job status message: status flows through _active_jobs[job_id] and is
+    # rendered by the shared live board. progress_callback also writes there, so
+    # passing status_msg=None makes its edit a no-op (only the board telemetry updates).
+    status_msg = job.get("status_msg")  # None for fs jobs
+    _set_job_status(job_id, "📥 Downloading...")
+
     file_path_str = None
     spec_path     = None
 
@@ -645,7 +722,7 @@ async def _run_forensic_job(job: dict):
             message=replied,
             file_name="/tmp/downloads/",
             progress=progress_callback,
-            progress_args=(status_msg, "Downloading Audio", start_time, [0.0], job.get("job_id"))
+            progress_args=(status_msg, "Downloading Audio", start_time, [0.0], job_id)
         )
         if not file_path_str:
             raise ValueError("Download yielded an empty path.")
@@ -654,10 +731,8 @@ async def _run_forensic_job(job: dict):
         filename  = getattr(file_obj, "file_name", temp_path.name)
         logger.info("Analysis start | user=%s chat=%d file=%s flags=%s", username, chat_id, filename, flags)
 
-        job_id = job.get("job_id")
         if want_spec and not want_info:
-            if job_id and job_id in _active_jobs: _active_jobs[job_id]["status"] = "Generating spectrogram..."
-            await safe_edit(status_msg, "📊 <b>Generating spectrogram...</b>", parse_mode=ParseMode.HTML)
+            _set_job_status(job_id, "📊 Generating spectrogram...")
             spec_path = await asyncio.wait_for(
                 asyncio.to_thread(generate_spectrogram, temp_path),
                 timeout=120
@@ -668,13 +743,11 @@ async def _run_forensic_job(job: dict):
                     file_name=f"{Path(filename).stem}_spectrogram.png",
                     caption=f"<b>Spectrogram</b> — {filename}"
                 )
-                await safe_delete(status_msg)
             else:
-                await safe_edit(status_msg, "❌ Spectrogram generation failed.", parse_mode=ParseMode.HTML)
+                await message.reply("❌ Spectrogram generation failed.", quote=True)
             return
 
-        if job_id and job_id in _active_jobs: _active_jobs[job_id]["status"] = "Analysing..."
-        await safe_edit(status_msg, "🔬 <b>Analysing...</b>", parse_mode=ParseMode.HTML)
+        _set_job_status(job_id, "🔬 Analysing...")
         report = await asyncio.wait_for(
             asyncio.to_thread(build_report, temp_path),
             timeout=300
@@ -700,45 +773,45 @@ async def _run_forensic_job(job: dict):
 
         page_url = None
         if want_info:
-            if job_id and job_id in _active_jobs: _active_jobs[job_id]["status"] = "Uploading to Telegraph..."
-            await safe_edit(status_msg, "🌐 <b>Uploading to Telegraph...</b>", parse_mode=ParseMode.HTML)
+            _set_job_status(job_id, "🌐 Uploading to Telegraph...")
             content  = make_telegraph_content(report, include_assessment=want_assessment)
             title_fmt = f"Analysis on {filename}"
             page_url  = await upload_to_telegraph(title_fmt, content)
 
-        safe_url = page_url or "#"
+        verdict_line = verdict_oneliner(report) if want_assessment else ""
         caption_text = (
             f"<blockquote><b>{artist} - {track_title}</b>\n"
             f"{album}{year}\n"
             f"{tec.duration} | {report.file_size_mb:.1f} MB\n"
-            f"{codec_raw} | {sample_rate_fmt}{precision_fmt} | {channels_fmt} | {tec.bit_rate}</blockquote>\n\n"
+            f"{codec_raw} | {sample_rate_fmt}{precision_fmt} | {channels_fmt} | {tec.bit_rate}</blockquote>\n"
         )
+        # Verdict one-liner sits at the bottom, just above the Full Analysis link.
+        if verdict_line:
+            caption_text += f"\n<b>{verdict_line}</b>"
         if want_info and page_url:
-            caption_text += f'<a href="{page_url}">Full Analysis</a>'
+            caption_text += f'\n<a href="{page_url}">▸ Full Analysis</a>'
         elif want_info and not page_url:
-            caption_text += "⚠ Telegraph upload failed."
+            caption_text += "\n⚠ Telegraph upload failed."
 
-        # Send results
+        # Single result message: spectrogram document (if requested) carries the
+        # caption, otherwise a plain reply. The board is torn down by the worker.
         if want_spec and spec_path and spec_path.exists():
-            await safe_edit(status_msg, "📤 <b>Uploading Spectrogram...</b>", parse_mode=ParseMode.HTML)
+            _set_job_status(job_id, "📤 Uploading spectrogram...")
             await message.reply_document(
                 document=str(spec_path),
                 file_name=f"{Path(filename).stem}_spectrogram.png",
-                caption=caption_text if want_info else f"<b>Spectrogram</b> — {filename}",
+                caption=caption_text,
                 progress=progress_callback,
-                progress_args=(status_msg, "Uploading Spectrogram", time.time(), [0.0], job.get("job_id"))
+                progress_args=(None, "Uploading Spectrogram", time.time(), [0.0], job_id)
             )
-            await safe_delete(status_msg)
-        elif want_info:
-            await safe_edit(status_msg, caption_text, disable_web_page_preview=False)
         else:
-            await safe_delete(status_msg)
+            await message.reply(caption_text, quote=True, disable_web_page_preview=False)
 
     except asyncio.TimeoutError:
-        await safe_edit(status_msg, "❌ <b>Analysis timed out.</b> The file may be too long or the system is overloaded.", parse_mode=ParseMode.HTML)
+        await message.reply("❌ <b>Analysis timed out.</b> The file may be too long or the system is overloaded.", quote=True)
     except Exception as e:
         logger.exception("Analysis error")
-        await safe_edit(status_msg, f"❌ <b>Process Interrupted:</b> {e}", parse_mode=ParseMode.HTML)
+        await message.reply(f"❌ <b>Process Interrupted:</b> {e}", quote=True)
     finally:
         if file_path_str and Path(file_path_str).exists():
             Path(file_path_str).unlink(missing_ok=True)

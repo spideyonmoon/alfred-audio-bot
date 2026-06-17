@@ -29,7 +29,9 @@ except ImportError:
 try:
     from scipy import signal as _sps
     from scipy.fft import rfft as _srfft, irfft as _sirfft, rfftfreq as _srfftfreq, next_fast_len as _next_fast_len
+    from scipy.fft import dct as _sdct
     from scipy.ndimage import uniform_filter1d as _uniform1d
+    from scipy.special import ndtr as _ndtr, ndtri as _ndtri
     _SCIPY_OK = True
 except ImportError:
     _SCIPY_OK = False
@@ -52,13 +54,44 @@ class C:
     BLUE    = "\033[38;5;110m"
 
 def _c(colour: str, text: str) -> str: return f"{colour}{text}{C.RESET}"
-def _kv(key: str, value: str, *, width: int = 26) -> str: return f"  {_c(C.CYAN, key.ljust(width))} {_c(C.WHITE, value)}" if value else ""
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+def _visible(s: str) -> str: return _ANSI_RE.sub("", s).strip()  # text with ANSI colour codes removed
+def _kv(key: str, value: str, *, width: int = 26) -> str: return f"  {_c(C.CYAN, key.ljust(width))} {_c(C.WHITE, value)}" if _visible(value) else ""
 def _rule(char: str = "─", width: int = 62) -> str: return _c(C.GREY, char * width)
 def _section(title: str) -> str: pad = max(0, 58 - len(title)); return f"\n{_c(C.GREY, '── ')}{_c(C.GOLD + C.BOLD, title)}{_c(C.GREY, ' ' + '─' * pad)}"
 def _subsection(title: str) -> str: return f"\n  {_c(C.GREY, title)}"
 def _camel_case(text: str) -> str:
     words = re.sub(r"[^a-zA-Z0-9 ]", "", text).split()
     return words[0].lower() + "".join(w.capitalize() for w in words[1:]) if words else ""
+
+# Status-gutter rows for the forensic detector lists: a left ✓/⚠/✗ column lets the
+# eye scan the margin for what fired, passed checks recede in dim grey, and flagged
+# rows stay bright. Status drives glyph, colour, and whether the row dims.
+#   ok   = a check that passed (dimmed)        warn = anomaly (orange ⚠)
+#   data = neutral measurement (white)         caut = borderline (yellow ⚠)
+#   info = analog/contextual note (blue →)     bad  = strong lossy flag (red ✗)
+_STATUS = {
+    "bad":  (C.RED,    "✗"), "warn": (C.ORANGE, "⚠"), "caut": (C.YELLOW, "⚠"),
+    "info": (C.BLUE,   "→"), "ok":   (C.GREEN,  "✓"), "data": (C.GREY,   " "),
+}
+_COL_STATUS = {C.RED: "bad", C.ORANGE: "warn", C.YELLOW: "caut", C.GREEN: "ok", C.BLUE: "info"}
+def _stat(col: str) -> str: return _COL_STATUS.get(col, "data")
+def _interp(text: str) -> str: return _c(C.DIM + C.GREY, text) if text else ""
+def _degl(text: str) -> str: return re.sub(r"^[✓⚠✗~→•]\s*", "", text)  # gutter shows the glyph now
+
+def _mrow(key: str, main: str, interp: str = "", status: str = "data", *, kw: int = 22) -> str:
+    """One detector row: gutter glyph + key + value (+ dim interp). Passed rows recede."""
+    if not main and not interp: return ""
+    gcol, gch = _STATUS.get(status, _STATUS["data"])
+    dim = status == "ok"
+    gutter = _c((C.DIM + gcol) if dim else gcol, gch)
+    keytxt = _c((C.DIM + C.GREY) if dim else C.CYAN, key.ljust(kw))
+    if dim:
+        body = _c(C.DIM + C.GREY, main + (f"   {interp}" if interp else ""))
+    else:
+        vcol = {"data": C.WHITE, "bad": C.RED, "warn": C.ORANGE, "caut": C.YELLOW, "info": C.BLUE}[status]
+        body = _c(vcol, main) + (f"   {_interp(interp)}" if interp else "")
+    return f"  {gutter} {keytxt} {body}"
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -82,6 +115,7 @@ class _Status:
         "resample check": 0.28,
         "header integrity": 0.29, "psychoacoustic tests": 0.30, "cassette profile": 0.41,
         "segment voting": 0.55, "silence & vinyl analysis": 0.57, "auCDtect statistics": 0.63,
+        "mdct quantization": 0.70,
         "waiting on loudness/spectrogram": 0.80, "finalizing": 0.97,
     }
 
@@ -212,6 +246,7 @@ class SpectralAnalysis:
     auc_avg_bound_freq: float = 0.0; auc_bound_interp: str = ""
     auc_prob_bound_freq: float = 0.0
     auc_phase_entropy: float = 0.0; auc_phase_interp: str = ""
+    mdct_quant_score: float = -1.0; mdct_quant_interp: str = ""
     scipy_available: bool = True
 
 @dataclass
@@ -442,15 +477,128 @@ def extract_loudness(filepath: Path) -> tuple[LoudnessProfile, str]:
     dr_score = f"DR{int(float(dr_match.group(1)))}" if dr_match else "N/A"
     return lp, dr_score
 
-def check_bit_depth_authenticity(filepath: Path, claimed_depth: int, duration_sec: float = 0.0) -> str:
-    """Effective-bit-depth forensics via trailing-zero analysis of raw PCM.
+# --- Bit-depth forensics constants -------------------------------------------
+# A bit rank must fire in >= this fraction of samples to count as "in use"
+# (robust to stray corrupt samples / a handful of denormal values).
+_BD_ACTIVE_FRAC = 1e-4
+# TPDF-dithered 16-bit noise floor: 6.02*N - 3 dB below full scale. Sample-rate
+# independent (the floor LEVEL doesn't move with SR — it just spreads over a wider
+# band). Sources: audiocheck.net/audiotests_dithering, tonmeister "High-Res Part 6".
+_BD_16BIT_FLOOR_DBFS = -93.0
+# To read a noise floor at all, the quietest sustained window must drop below this.
+# Loudness-war commercial masters sit far above it (measured quietest-window RMS:
+# -26 dBFS web hi-res, -34 redbook, -59 MFSL) -> the floor is masked -> we ABSTAIN.
+_BD_FLOOR_EXPOSED_DBFS = -86.0
+# A floor below this proves content exists beneath the 16-bit dither floor -> the
+# source genuinely carries >16-bit information (cannot be a 16-bit upsample). Set a
+# few dB under the dither floor's lower edge (TPDF runs -93..-99 dBFS depending on
+# the dither) so a real 16-bit floor never tips into a "genuine hi-res" reading.
+_BD_GENUINE_HIRES_DBFS = -102.0
+# Only assert "sitting at the 16-bit dither level" when the flat floor is actually
+# down near -93 dBFS; a flat floor higher than this is worse than 16-bit (limited DR).
+_BD_16BIT_LEVEL_MAX_DBFS = -89.0
+# |HF-LF| of the exposed floor below this => spectrally flat/white = TPDF dither
+# signature (16-bit tell). Above it and LF-heavy => analog hiss (genuine analog).
+_BD_FLOOR_FLAT_TOL_DB = 7.0
+
+
+def _effective_bits(arr_i32: "np.ndarray", channels: int) -> int:
+    """Highest bit-depth actually exercised, MSB-aligned, across all channels.
+
+    ffmpeg renders an N-bit sample MSB-aligned in the 32-bit container (a 16-bit
+    value lands on multiples of 2**16, a 24-bit value on multiples of 2**8). The
+    lowest bit rank hit by >= _BD_ACTIVE_FRAC of a channel's nonzero samples marks
+    that channel's live depth; we take the deepest channel so a one-channel pad (or
+    a silent channel) can't mask bits the file really uses.
+    """
+    if channels < 1:
+        channels = 1
+    usable = (arr_i32.size // channels) * channels
+    deck = arr_i32[:usable].reshape(-1, channels)
+    best = 0
+    for ch in range(channels):
+        nz = deck[:, ch][deck[:, ch] != 0].astype(np.int64)
+        if nz.size < 500:
+            continue
+        tz = np.log2((nz & -nz).astype(np.float64)).astype(np.int64)   # exact trailing zeros
+        counts = np.bincount(tz, minlength=33)
+        threshold = max(8, int(nz.size * _BD_ACTIVE_FRAC))
+        cum = np.cumsum(counts)
+        eff = 32 - int(np.argmax(cum >= threshold))
+        best = max(best, eff)
+    return best
+
+
+def _noise_floor_profile(arr_i32: "np.ndarray", channels: int, sample_rate: int) -> "dict | None":
+    """Expose the noise floor underneath the music, if the master has any quiet.
+
+    Returns a dict {floor_db, peak_db, flat, slope_db} or None when the window is
+    unusable. ``floor_db`` is the 1.5th-percentile broadband RMS over 100 ms blocks
+    (full scale = 1.0); ``flat`` flags a white/TPDF-shaped floor (the 16-bit dither
+    tell) vs. an LF-heavy analog floor; ``slope_db`` = HF-band minus LF-band level
+    of the quietest blocks.
+    """
+    if not _NUMPY_OK or sample_rate < 8000:
+        return None
+    usable = (arr_i32.size // max(1, channels)) * max(1, channels)
+    if usable < sample_rate:
+        return None
+    mono = arr_i32[:usable].reshape(-1, max(1, channels)).astype(np.float64).mean(axis=1) / (2.0 ** 31)
+    block = sample_rate // 10
+    n = len(mono) // block
+    if n < 20:
+        return None
+    blocks = mono[: n * block].reshape(n, block)
+    rms = np.sqrt(np.mean(blocks * blocks, axis=1))
+    rms = rms[rms > 0]
+    if rms.size < 20:
+        return None
+    floor_lin = float(np.percentile(rms, 1.5))
+    peak_lin = float(np.percentile(rms, 99))
+    if floor_lin <= 0:
+        return None
+    floor_db = 20.0 * math.log10(floor_lin)
+    peak_db = 20.0 * math.log10(peak_lin) if peak_lin > 0 else 0.0
+
+    # Spectral colour of the quietest 10% of blocks (noise-floor dominated).
+    order = np.argsort(rms)
+    quiet_idx = order[: max(3, n // 10)]
+    quiet = blocks[quiet_idx] * np.hanning(block)
+    spec = np.mean(np.abs(np.fft.rfft(quiet, axis=1)) ** 2, axis=0)
+    freqs = np.fft.rfftfreq(block, 1.0 / sample_rate)
+    lf = spec[(freqs > 150) & (freqs < 2000)]
+    hf = spec[(freqs > sample_rate * 0.33) & (freqs < sample_rate * 0.45)]
+    slope_db = float("nan")
+    flat = False
+    if lf.size and hf.size and lf.mean() > 0 and hf.mean() > 0:
+        slope_db = 10.0 * math.log10(hf.mean() / lf.mean())
+        flat = abs(slope_db) < _BD_FLOOR_FLAT_TOL_DB
+    return {"floor_db": floor_db, "peak_db": peak_db, "flat": flat, "slope_db": slope_db}
+
+
+def check_bit_depth_authenticity(filepath: Path, claimed_depth: int, duration_sec: float = 0.0,
+                                 sample_rate: int = 0, channels: int = 0) -> str:
+    """Two-prong effective-bit-depth forensics.
 
     Decodes a 30 s window (from the middle of the track — intros/outros are often
-    quiet or faded) as 32-bit PCM and measures how many low-order bits actually
-    carry signal. A genuine 24-bit master uses all 24 (dither alone guarantees a
-    live LSB); 16-bit content zero-padded into a 24-bit container leaves the bottom
-    8 bits dead in every single sample. Robust to stray corrupt samples: a bit rank
-    must be exercised by at least 0.01% of samples to count.
+    quiet or faded) as interleaved-stereo 32-bit PCM (never mono-downmixed: averaging
+    L+R injects a half-LSB and corrupts the bit pattern) and runs two independent
+    tests:
+
+    Prong 1 — used bits. The lowest bit rank actually exercised reveals clean
+    integer zero-padding: 16-bit content shifted into a 24-bit container leaves the
+    bottom 8 bits dead in every sample. Per-channel, robust to stray samples. This
+    is a *proof* of padding when it fires, but it is BLIND to dithered/float/lossy
+    upscales, whose low bits go live (so "all bits used" must NOT be reported as a
+    confident "verified 24-bit" — that overclaims).
+
+    Prong 2 — noise floor / effective dynamic range. The only signal that sees
+    through a dithered upscale, but bounded by physics: a 16-bit step is detectable
+    only when the source genuinely holds content below the 16-bit dither floor
+    (-93 dBFS). On loud masters with no exposed floor the prong ABSTAINS (the honest
+    answer); when a quiet passage exists it either CONFIRMS genuine >16-bit content
+    (floor < -99 dBFS) or flags an effective-16-bit ceiling (a flat/white floor
+    sitting right at -93 dBFS under a >16-bit container).
     """
     if not claimed_depth: return ""
     if not _NUMPY_OK: return f"claimed {claimed_depth}-bit — numpy unavailable, not verified"
@@ -464,22 +612,70 @@ def check_bit_depth_authenticity(filepath: Path, claimed_depth: int, duration_se
         return f"claimed {claimed_depth}-bit — decode failed, not verified"
 
     arr = np.frombuffer(result.stdout[: len(result.stdout) // 4 * 4], dtype=np.int32)
-    nz = arr[arr != 0].astype(np.int64)
-    if nz.size < 1000:
+    nz_total = int(np.count_nonzero(arr))
+    if nz_total < 1000:
         return f"claimed {claimed_depth}-bit — sampled window is silent, not verified"
 
-    tz = np.log2((nz & -nz).astype(np.float64)).astype(np.int64)   # trailing zeros, exact
-    counts = np.bincount(tz, minlength=33)
-    threshold = max(10, nz.size // 10000)                           # ≥0.01% of samples
-    cum = np.cumsum(counts)
-    effective_bits = 32 - int(np.argmax(cum >= threshold))
+    # Caller passes the probed channel count; fall back to interleave detection
+    # (both lanes populated under a stereo assumption => stereo, else mono).
+    if channels < 1:
+        channels = 2 if arr.size >= 2 and np.count_nonzero(arr[1::2]) > 0 else 1
+    effective_bits = _effective_bits(arr, channels)
 
-    if effective_bits >= claimed_depth:
-        return f"✓ Verified {claimed_depth}-bit — all {claimed_depth} bits in active use"
-    elif effective_bits <= claimed_depth - 8:
-        return f"⚠ Upscaled: {claimed_depth}-bit container but only {effective_bits} bits carry signal — padded from {effective_bits}-bit source"
-    else:
-        return f"~ {effective_bits} of {claimed_depth} bits in use — bit-shifted gain or fixed-point processing chain"
+    if sample_rate < 8000:
+        # Last-resort rate estimate from the byte count (a full 30 s clip). The floor
+        # LEVEL is sample-rate independent, so this only affects block sizing.
+        span = min(30.0, duration_sec) if duration_sec else 30.0
+        est = (arr.size / max(1, channels)) / span if span > 0 else 44100
+        sample_rate = min((44100, 48000, 88200, 96000, 176400, 192000, 22050),
+                          key=lambda r: abs(r - est))
+    prof = _noise_floor_profile(arr, channels, sample_rate)
+    return _bit_depth_verdict(claimed_depth, effective_bits, prof)
+
+
+def _bit_depth_verdict(claimed_depth: int, effective_bits: int, prof: "dict | None") -> str:
+    """Pure verdict logic for the two prongs (separated for unit testing).
+
+    ``effective_bits`` is the deepest bit rank exercised (Prong 1); ``prof`` is the
+    noise-floor profile from ``_noise_floor_profile`` or None when unmeasurable.
+    """
+    # Prong 1: a clean integer pad (low bits hard-zero) is conclusive.
+    if effective_bits and effective_bits <= claimed_depth - 8:
+        return (f"⚠ Upscaled: {claimed_depth}-bit container but only {effective_bits} bits carry "
+                f"signal — clean integer pad from a {effective_bits}-bit source")
+    if effective_bits and effective_bits < claimed_depth:
+        return (f"~ {effective_bits} of {claimed_depth} bits exercised — reduced-depth master, "
+                f"bit-shifted gain, or fixed-point chain (not zero-padded)")
+
+    # Prong 2: bits are fully live. "All bits used" alone does NOT prove the source
+    # depth (a dithered/float upscale fills them too) — consult the noise floor.
+    if prof is None:
+        return f"✓ {claimed_depth}-bit container fully exercised — source depth not independently confirmable"
+    floor, flat = prof["floor_db"], prof["flat"]
+
+    # No exposed floor (loud master) -> abstain honestly.
+    if floor > _BD_FLOOR_EXPOSED_DBFS:
+        return (f"✓ {claimed_depth}-bit container fully exercised — noise floor masked by a loud "
+                f"master ({floor:.0f} dBFS), source depth not independently confirmable")
+
+    # Floor proves content below the 16-bit dither floor -> genuine high-res.
+    if floor < _BD_GENUINE_HIRES_DBFS:
+        eff_dr = max(claimed_depth, int(round((-floor - 1.76) / 6.02)))
+        return (f"✓ Genuine {claimed_depth}-bit — noise floor at {floor:.0f} dBFS confirms content "
+                f"below the 16-bit limit (~{eff_dr}-bit dynamic range)")
+
+    # Floor is exposed but sits in 16-bit territory (-102 .. -86 dBFS).
+    eff_dr = int(round((-floor - 1.76) / 6.02))
+    if claimed_depth >= 24 and flat and floor <= _BD_16BIT_LEVEL_MAX_DBFS:
+        # Flat/white floor right at the 16-bit dither level = the TPDF tell.
+        return (f"⚠ Effective ~16-bit — {claimed_depth}-bit container but a flat noise floor at "
+                f"{floor:.0f} dBFS (the 16-bit dither level) — upsampled from 16-bit")
+    if claimed_depth >= 24:
+        colour = "colored/analog" if not flat else "limited dynamic range"
+        return (f"~ Noise floor {floor:.0f} dBFS (~{eff_dr}-bit effective, {colour}) — consistent with "
+                f"an analog-sourced or heavily-compressed {claimed_depth}-bit master; source depth unconfirmable")
+    # claimed 16-bit (or 20) with a floor at the 16-bit level == consistent.
+    return f"✓ {claimed_depth}-bit consistent — noise floor at {floor:.0f} dBFS matches the claimed depth"
 
 # --- Byproduct metrics: computed from the SpectralEngine's decoded audio.
 #     Replaces three full ffmpeg invocations (aphasemeter, astats clipping,
@@ -1291,6 +1487,142 @@ class SpectralEngine:
         return score, reasons, preecho_pct, aliasing_corr, mp3_noise_pattern
 
     # -----------------------------------------------------------------------
+    # MDCT quantization-error detector (Derrien, JAES 2019) — high-bitrate backstop
+    # -----------------------------------------------------------------------
+    # AAC scalefactor-band offsets for the long (1024-coeff) window, fs index 3/4
+    # (48 kHz and 44.1 kHz share this 49-band table). ISO/IEC 14496-3.
+    _SWB_LONG_44_48 = (
+        0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108,
+        120, 132, 144, 160, 176, 196, 216, 240, 264, 292, 320, 352, 384, 416, 448,
+        480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800, 832, 864, 896, 928, 1024)
+
+    def _kbd_window(self, n2: int, alpha: float = 4.0) -> "np.ndarray":
+        """Kaiser-Bessel-Derived analysis window of length n2 (the AAC long-window
+        shape; ffmpeg's AAC encoder uses KBD). Cached per length."""
+        cache = getattr(self, "_kbd_cache", None)
+        if cache is None:
+            cache = self._kbd_cache = {}
+        if n2 in cache:
+            return cache[n2]
+        m = n2 // 2
+        k = _sps.windows.kaiser(m + 1, math.pi * alpha)
+        cs = np.cumsum(k)
+        rising = np.sqrt(cs[:m] / cs[m])
+        win = np.concatenate([rising, rising[::-1]]).astype(np.float64)
+        cache[n2] = win
+        return win
+
+    def _mdct_batch(self, frames2n: "np.ndarray", win: "np.ndarray") -> "np.ndarray":
+        """MDCT of a batch of length-2N frames -> N coefficients each, via the
+        Princen-Bradley time-domain-aliasing fold followed by an orthonormal DCT-IV."""
+        n = frames2n.shape[1] // 2
+        x = frames2n * win
+        a, b = x[:, : n // 2], x[:, n // 2 : n]
+        c, d = x[:, n : n + n // 2], x[:, n + n // 2 :]
+        folded = np.concatenate([-c[:, ::-1] - d, a - b[:, ::-1]], axis=1)
+        return _sdct(folded, type=4, norm="ortho", axis=1, workers=-1)
+
+    def _mdct_quant_error(self, mid: "np.ndarray", side: "np.ndarray | None") -> float:
+        """Derrien's blind genuine-lossless test. A lossy AAC encoder rounds scaled
+        MDCT coefficients to integers; re-applying the same MDCT + scaling + rounding
+        to an already-transcoded signal yields near-zero error, whereas genuine
+        lossless audio yields the usual U[-1/2,1/2] quantization error. Per AAC
+        scalefactor band we measure the rounding-error energy E and count bands where
+        E < gamma (gamma set so genuine P(E<gamma)=0.01). c = fraction of flagged
+        bands, averaged over high-energy anchor frames at a shared block-grid phase;
+        the returned L is the max c over channels, scalefactor levels and phases.
+        Transcoded => high L (AAC256 ~0.18, AAC320 ~0.13); genuine => low L (<0.04).
+
+        This is the backstop for high-bitrate AAC transcodes that keep full bandwidth
+        and so leave no lowpass wall for the cutoff/void/fingerprint rules to catch.
+        Only meaningful at 44.1/48 kHz (the swb table is rate-specific). Returns -1
+        when not applicable (wrong rate, too short)."""
+        sr = self.sample_rate
+        if sr not in (44100, 48000):
+            return -1.0
+        N, N2 = 1024, 2048
+        swb = np.asarray(self._SWB_LONG_44_48, dtype=int)
+        seg_starts, counts = swb[:-1], np.diff(swb)
+        K = counts.astype(float)
+        # gamma(K): truncated-normal (on [0, inf)) quantile so genuine P(E<gamma)=P.
+        # E = sum of K squared-uniform errors -> mean K/12, var K/180 by the CLT.
+        P = 0.01
+        mu, sigma = K / 12.0, np.sqrt(K / 180.0)
+        lo = _ndtr(-mu / sigma)
+        gam = mu + sigma * _ndtri(P + (1.0 - P) * lo)
+
+        # AAC quantizer/dead-zone constants assume ~16-bit integer PCM scale
+        cap_n = int(self.TIME_DOMAIN_CAP_S * sr)
+        mid = np.ascontiguousarray(mid[:cap_n], dtype=np.float64) * 32768.0
+        if len(mid) < N2 * 4:
+            return -1.0
+        channels = [("M", mid)]
+        if side is not None:
+            channels.append(("S", np.ascontiguousarray(side[:cap_n], dtype=np.float64) * 32768.0))
+
+        win = self._kbd_window(N2)
+        n_anchors, n_sf, phase_step = 16, 8, 8
+        phases = np.arange(0, N, phase_step)
+
+        # Pick high-energy, well-separated anchor positions from the mid channel
+        hop = N
+        npos = (len(mid) - N2) // hop
+        if npos < 2:
+            return -1.0
+        csq = np.concatenate(([0.0], np.cumsum(mid * mid)))   # window energies via prefix sums
+        starts = np.arange(npos) * hop
+        eblk = csq[starts + N2] - csq[starts]
+        # Digital silence rounds every coefficient to zero -> every band flags -> a
+        # spurious L=1. Require the loudest anchor to carry real signal (RMS > -70 dBFS
+        # at 16-bit scale; 32768*10^(-70/20) ~= 10 -> mean-square ~= N2*100).
+        if float(eblk.max()) < N2 * 100.0:
+            return -1.0
+        anchors = []
+        for idx in np.argsort(eblk)[::-1]:
+            pos = int(idx) * hop
+            base = pos - N // 2
+            if base < 0 or base + (N - 1) + N2 > len(mid):
+                continue
+            if all(abs(pos - p) > N2 for p in anchors):
+                anchors.append(pos)
+            if len(anchors) >= n_anchors:
+                break
+        if not anchors:
+            return -1.0
+
+        bestL = 0.0
+        for _name, sig in channels:
+            windows = np.empty((len(anchors) * len(phases), N2), dtype=np.float64)
+            for ai, a in enumerate(anchors):
+                base = a - N // 2
+                for pi, phi in enumerate(phases):
+                    windows[ai * len(phases) + pi] = sig[base + phi : base + phi + N2]
+            X = np.abs(self._mdct_batch(windows, win))
+            maxX = np.maximum(np.maximum.reduceat(X, seg_starts, axis=1), 1e-12)
+            sdz = 16.0 + (4.0 / 3.0) * np.log2(maxX)          # dead-zone scalefactor (Eq. 2)
+            smin, smax = 0.3 * sdz, 0.7 * sdz                  # 90% of real AAC scalefactors
+            Xp = X ** 0.75                                      # AAC ^0.75 power-law quantizer
+            c_sf_phase = np.zeros((n_sf, len(phases)))
+            for i_sf in range(n_sf):
+                frac = i_sf / (n_sf - 1) if n_sf > 1 else 0.0
+                s_band = smin + frac * (smax - smin)
+                scale_bins = np.repeat(2.0 ** (-3.0 * s_band / 16.0), counts, axis=1)
+                xsc = Xp * scale_bins
+                eps = np.round(xsc) - xsc
+                E = np.add.reduceat(eps * eps, seg_starts, axis=1)
+                c = (E < gam[None, :]).mean(axis=1)
+                c_sf_phase[i_sf] = c.reshape(len(anchors), len(phases)).mean(axis=0)
+            bestL = max(bestL, float(c_sf_phase.max()))
+        return bestL
+
+    @staticmethod
+    def _interp_mdct(score: float) -> str:
+        if score < 0: return "n/a (only 44.1/48 kHz)"
+        if score < 0.06: return "✓ no MDCT quantization lattice — clean coefficient statistics"
+        if score < 0.10: return "~ faint coefficient clustering"
+        return "⚠ MDCT quantization lattice — AAC transcode signature"
+
+    # -----------------------------------------------------------------------
     # Rule 11 — analogue cassette source profiler (false-positive bypass)
     # -----------------------------------------------------------------------
     def _cassette_source(self, audio: "np.ndarray", frames: "np.ndarray", bins: "np.ndarray",
@@ -1869,6 +2201,24 @@ class SpectralEngine:
                 main += 15
                 lossy_ev.append(f"Fake HF Noise Injection: ultrasonic band is statistically independent of the music (corr {ultra:.2f}) while organic scatter dies at {auc_avg:,.0f} Hz — noise pasted above a codec wall.")
 
+            # Rule: MDCT quantization-error lattice (Derrien JAES 2019) — the backstop
+            # for high-bitrate AAC transcodes that keep full bandwidth and so leave no
+            # lowpass wall for any cutoff/void/fingerprint rule to catch. Blind, no
+            # reference, near-zero false-positive (genuine masters read < 0.04; AAC 256
+            # ~0.18, AAC 320 ~0.13). Skip analog/DSD sources — only AAC's exact MDCT
+            # grid produces the lattice, and the swb table is 44.1/48 kHz only.
+            if (not self.native_dsd and not vinyl_detected and not cassette_detected
+                    and self.sample_rate in (44100, 48000)):
+                st("mdct quantization")
+                mdct_L = self._mdct_quant_error(audio, side)
+                result.mdct_quant_score = mdct_L
+                if mdct_L >= 0.10:
+                    main += 55
+                    lossy_ev.append(f"MDCT Quantization Lattice: scaled MDCT coefficients re-round to integers across {mdct_L * 100:.0f}% of scalefactor bands (genuine lossless < 4%) — the fingerprint of an AAC encoder's quantizer surviving in 'lossless' PCM, with no lowpass wall to betray it.")
+                elif mdct_L >= 0.06:
+                    main += 15
+                    lossy_ev.append(f"Faint MDCT Coefficient Clustering: a weak integer-rounding lattice in the MDCT domain (strength {mdct_L:.3f}) — possible high-bitrate transcode.")
+
         main = max(0, min(100, main))
         label, sentence, caveats = self._verdict(main, net_score, cutoff_hz, dsd_detected, cassette_detected, vinyl_detected,
                                                  resampled_from=result.resample_src_rate, fake_hires=result.fake_hires)
@@ -1893,6 +2243,7 @@ class SpectralEngine:
         result.hf_env_corr_interp = self._interp_ultra_corr(result.hf_envelope_correlation)
         result.auc_bound_interp = self._interp_bound(result.auc_avg_bound_freq)
         result.auc_phase_interp = self._interp_phase_entropy(result.auc_phase_entropy, legit_cutoff)
+        result.mdct_quant_interp = self._interp_mdct(result.mdct_quant_score)
         result.verdict_label, result.primary_verdict = label, sentence
         result.evidence, result.natural_evidence, result.caveats = lossy_ev, natural_ev, caveats
         return result
@@ -1938,7 +2289,7 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
         f_loud = pool.submit(extract_loudness, filepath)
         f_sox = pool.submit(extract_sox_stats, filepath)
         f_spec = pool.submit(generate_spectrogram, filepath, tech.duration_sec)
-        f_bits = pool.submit(check_bit_depth_authenticity, filepath, claimed_depth, tech.duration_sec)
+        f_bits = pool.submit(check_bit_depth_authenticity, filepath, claimed_depth, tech.duration_sec, sample_rate, channels)
         spectral = engine.analyse(max_seconds=fast_secs, status=lambda s: _Status.update(name, s))
         _Status.update(name, "waiting on loudness/spectrogram")
         lp, dr = f_loud.result()
@@ -2069,6 +2420,12 @@ def _sparsity_colour(s: float) -> str:
     if s < 0.30: return C.WHITE
     return C.ORANGE
 
+def _mdct_colour(s: float) -> str:
+    if s < 0: return C.GREY
+    if s < 0.06: return C.GREEN
+    if s < 0.10: return C.WHITE
+    return C.ORANGE
+
 def _ultra_corr_colour(c: float) -> str:
     if c > 0.3: return C.GREEN
     if c > 0.15: return C.WHITE
@@ -2159,9 +2516,50 @@ def _sox_amplitude_colour(key: str, raw: str) -> str:
     except ValueError: return C.WHITE
     return C.WHITE
 
+_VERDICT_GLYPH = {"GENUINE": "✓", "LIKELY_GENUINE": "✓", "CAUTION": "~", "SUSPICIOUS": "⚠", "LIKELY_LOSSY": "✗"}
+_VERDICT_COL = {"GENUINE": C.GREEN, "LIKELY_GENUINE": C.GREEN, "CAUTION": C.YELLOW, "SUSPICIOUS": C.ORANGE, "LIKELY_LOSSY": C.RED}
+
+def _print_banner(report: ForensicReport, sz: Optional[float]) -> None:
+    """Executive summary at the very top — verdict, headline finding, and the key
+    specs in the first six lines, so the conclusion lands before the detail does."""
+    sp, tec, lp = report.authenticity.spectral, report.technical, report.loudness
+    lbl = "VERDICT".ljust(9)
+    if sp and sp.verdict_label not in ("", "INCONCLUSIVE"):
+        vcol = _VERDICT_COL.get(sp.verdict_label, C.WHITE)
+        glyph = _VERDICT_GLYPH.get(sp.verdict_label, "·")
+        filled = max(0, min(10, int(sp.net_confidence_pct / 10)))
+        bar = _c(vcol, "█" * filled) + _c(C.GREY, "░" * (10 - filled))
+        head = f"{glyph} {sp.verdict_label.replace('_', ' ')}"
+        score = _c(_main_score_colour(sp.main_score), f"{sp.main_score}/100")
+        print(f"  {_c(C.GREY, lbl)}{_c(vcol + C.BOLD, head)}  {_c(C.GREY, '·')}  {score}   {bar}")
+        if sp.primary_verdict:
+            print(f"  {' ' * 9}{_c(vcol, sp.primary_verdict)}")
+    else:
+        verdict = report.authenticity.spectral_cutoff_verdict or "INCONCLUSIVE"
+        print(f"  {_c(C.GREY, lbl)}{_c(C.WHITE, verdict)}")
+    specs = [s for s in (tec.sample_encoding, _hz_label(tec.sample_rate) if tec.sample_rate else "",
+                         _channel_label(tec.channels) if tec.channels else "", tec.duration,
+                         f"{sz:.1f} MB" if sz is not None else "") if s]
+    if specs:
+        print(f"  {_c(C.GREY, 'FILE'.ljust(9))}{_c(C.WHITE, '  ·  '.join(specs))}")
+    loud = []
+    if report.dr_score and report.dr_score != "N/A": loud.append(_c(_dr_assessment(report.dr_score)[0], report.dr_score))
+    if lp.lufs_integrated: loud.append(_c(_lufs_colour(lp.lufs_integrated), f"{lp.lufs_integrated} LUFS"))
+    if lp.true_peak_dbtp: loud.append(_c(_peak_colour(lp.true_peak_dbtp), f"{lp.true_peak_dbtp} dBTP"))
+    elif lp.peak_db: loud.append(_c(_peak_colour(lp.peak_db), f"peak {_db(lp.peak_db)}"))
+    if loud:
+        print(f"  {_c(C.GREY, 'LOUDNESS'.ljust(9))}{_c(C.GREY, '  ·  ').join(loud)}")
+    if sp and sp.verdict_label not in ("", "INCONCLUSIVE"):
+        nl, nn = len(sp.evidence), len(sp.natural_evidence)
+        genuine = sp.verdict_label in ("GENUINE", "LIKELY_GENUINE")
+        sig = _c(C.GREY if (genuine or not nl) else C.ORANGE, f"⚠ {nl} lossy") + _c(C.GREY, "  ·  ") + _c(C.GREEN if nn else C.GREY, f"✓ {nn} natural")
+        print(f"  {_c(C.GREY, 'SIGNALS'.ljust(9))}{sig}")
+
 def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None) -> None:
     t, tec, lp, auth, sz = report.tags, report.technical, report.loudness, report.authenticity, file_size_mb if file_size_mb is not None else report.file_size_mb
     W = 62; print(); print(_rule("═", W)); print(f"  {_c(C.BOLD + C.WHITE, report.filepath.name)}"); print(_rule("═", W))
+    print()
+    _print_banner(report, sz)
     print(_section("IDENTITY"))
     for row in [_kv("Duration", tec.duration), _kv("BPM", t.bpm), _kv("File Size", f"{sz:.1f} MB")]:
         if row: print(row)
@@ -2203,70 +2601,66 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     print(_subsection("Spectral Analysis  (numpy FFT engine)"))
     sp = auth.spectral
     if sp and sp.verdict_label != "INCONCLUSIVE":
-        conf_filled  = int(sp.net_confidence_pct / 10); conf_empty = 10 - conf_filled
-        verdict_col  = {"GENUINE": C.GREEN, "LIKELY_GENUINE":C.GREEN, "CAUTION": C.YELLOW, "SUSPICIOUS": C.ORANGE, "LIKELY_LOSSY": C.RED}.get(sp.verdict_label, C.WHITE)
-        conf_bar = _c(verdict_col, "█" * conf_filled) + _c(C.GREY, "░" * conf_empty)
-        print(f"  {conf_bar} {_c(verdict_col + C.BOLD, sp.primary_verdict)}")
-        print(f"  {_c(_main_score_colour(sp.main_score), f'Main Score: {sp.main_score}/100')}  {_c(C.GREY, '(0 = pristine lossless · 100 = certain transcode)')}")
-        print(f"  {_c(C.GREY, f'Base engine: Lossy {sp.lossy_score} − Natural {sp.natural_score} = Net {sp.net_score}/{sp.max_score}  |  Raw Error Rate: {sp.raw_lossy_pct:.1f}%')}")
+        print(f"  {_c(C.GREY, f'Main score {sp.main_score}/100  ·  base engine: lossy {sp.lossy_score} − natural {sp.natural_score} = net {sp.net_score}/{sp.max_score}  ·  raw error {sp.raw_lossy_pct:.1f}%')}")
+        print(f"  {_c(C.DIM + C.GREY, '0 = pristine lossless   ·   100 = certain transcode')}")
         print()
         rows_spec = [
-            _kv("Ultrasonic Noise", _c(C.ORANGE, "⚠ DSD/SACD Transcode Profile") if sp.dsd_detected else _c(C.GREEN, "✓ Normal")),
-            _kv("HF Cutoff",         sp.cutoff_hz_str),
-            _kv("Cutoff Variance",   f"{sp.cutoff_variance:.1f} Hz²  " + _c(C.GREY, sp.cutoff_variance_interp)),
-            _kv("Cliff Sharpness",   f"{sp.cutoff_sharpness_db:.1f} dB/bin · {sp.cliff_depth_db:.0f} dB drop/800Hz  " + _c(C.GREY, sp.cutoff_sharpness_interp)),
-            _kv("HF Energy Ratio",   f"{sp.hf_energy_ratio:.5f}  " + _c(C.GREY, sp.hf_energy_interp)),
-            _kv("Side Anomaly",      f"{sp.side_anomaly_score:.3f}  " + _c(C.GREY, sp.side_interp)),
-            _kv("Banding Score",     f"{sp.banding_score:.3f}  " + _c(C.GREY, sp.banding_interp)),
-            _kv("NF Above Cutoff",   f"{sp.nf_above_cutoff_db:.1f} dB  " + _c(C.GREY, sp.nf_interp)),
-            _kv("LPF",              ("⚠ YES — " + sp.lpf_cutoff_str) if sp.lpf_detected else "✓ None detected"),
-            _kv("Spectral Entropy", f"{sp.entropy:.3f}  " + _c(C.GREY, sp.entropy_interp)),
+            _mrow("Ultrasonic Noise", "DSD/SACD transcode profile", "", "warn") if sp.dsd_detected else _mrow("Ultrasonic Noise", "Normal", "", "ok"),
+            _mrow("HF Cutoff",        sp.cutoff_hz_str, "", "data"),
+            _mrow("Cutoff Variance",  f"{sp.cutoff_variance:.1f} Hz²", sp.cutoff_variance_interp, "data"),
+            _mrow("Cliff Sharpness",  f"{sp.cutoff_sharpness_db:.1f} dB/bin · {sp.cliff_depth_db:.0f} dB drop/800Hz", sp.cutoff_sharpness_interp, "data"),
+            _mrow("HF Energy Ratio",  f"{sp.hf_energy_ratio:.5f}", sp.hf_energy_interp, "data"),
+            _mrow("Side Anomaly",     f"{sp.side_anomaly_score:.3f}", sp.side_interp, "data"),
+            _mrow("Banding Score",    f"{sp.banding_score:.3f}", sp.banding_interp, "data"),
+            _mrow("NF Above Cutoff",  f"{sp.nf_above_cutoff_db:.1f} dB", sp.nf_interp, "data"),
+            _mrow("LPF", f"detected — {sp.lpf_cutoff_str}", "", "warn") if sp.lpf_detected else _mrow("LPF", "none detected", "", "ok"),
+            _mrow("Spectral Entropy", f"{sp.entropy:.3f}", sp.entropy_interp, "data"),
         ]
         for row in rows_spec:
             if row: print(row)
 
         print(_subsection("Advanced DSP Forensics  (scipy suite)"))
         if sp.scipy_available:
-            if sp.segment_walled < 0: seg_val = _c(C.GREY, "n/a — file too short for 7-segment voting")
+            if sp.segment_walled < 0: seg = _mrow("Segment Vote", "n/a — file too short for 7-segment voting", "", "data")
             else:
                 seg_majority = sp.segment_walled > sp.segment_total / 2
-                seg_col = C.RED if seg_majority else (C.YELLOW if sp.segment_walled > 0 else C.GREEN)
-                seg_state = "✗ FAILED" if seg_majority else ("~ partial walls" if sp.segment_walled > 0 else "✓ passed")
-                seg_val = _c(seg_col, f"{seg_state} — {sp.segment_walled}/{sp.segment_total} clips walled ≤{sp.segment_wall_hz / 1000:.1f} kHz")
-            if sp.silence_ratio < 0: sil_val = _c(C.GREY, "n/a — no silent passages ≥ 0.5s found")
-            else: sil_val = _c(_silence_ratio_colour(sp.silence_ratio), f"{sp.silence_ratio:.3f}") + "  " + _c(C.GREY, "[<0.15 clean · >0.3 codec hash in silence]")
-            if sp.vinyl_noise_detected: vinyl_val = _c(C.BLUE, f"✓ surface noise detected ({sp.vinyl_clicks_per_min:.0f} clicks/min)")
-            else: vinyl_val = _c(C.GREY, "not detected")
-            if sp.cassette_score >= 30: cass_val = _c(C.BLUE, f"✓ tape profile matched (score {sp.cassette_score}/80)")
-            elif sp.cassette_score > 0: cass_val = _c(C.GREY, f"weak match (score {sp.cassette_score}/80)")
-            else: cass_val = _c(C.GREY, "not detected")
+                seg_st = "bad" if seg_majority else ("caut" if sp.segment_walled > 0 else "ok")
+                seg_state = "failed" if seg_majority else ("partial walls" if sp.segment_walled > 0 else "passed")
+                seg = _mrow("Segment Vote", f"{seg_state} — {sp.segment_walled}/{sp.segment_total} clips walled ≤{sp.segment_wall_hz / 1000:.1f} kHz", "", seg_st)
+            if sp.silence_ratio < 0: sil = _mrow("Silence Dither", "n/a — no silent passages ≥ 0.5s found", "", "data")
+            else: sil = _mrow("Silence Dither", f"{sp.silence_ratio:.3f}", "[<0.15 clean · >0.3 codec hash in silence]", _stat(_silence_ratio_colour(sp.silence_ratio)))
+            if sp.vinyl_noise_detected: vinyl = _mrow("Vinyl Source", f"surface noise detected ({sp.vinyl_clicks_per_min:.0f} clicks/min)", "", "info")
+            else: vinyl = _mrow("Vinyl Source", "not detected", "", "data")
+            if sp.cassette_score >= 30: cass = _mrow("Cassette Source", f"tape profile matched (score {sp.cassette_score}/80)", "", "info")
+            elif sp.cassette_score > 0: cass = _mrow("Cassette Source", f"weak match (score {sp.cassette_score}/80)", "", "data")
+            else: cass = _mrow("Cassette Source", "not detected", "", "data")
             hdr_mm = sp.header_duration_mismatch or sp.header_bitrate_mismatch
-            fp_val = _c(C.RED, f"⚠ {sp.codec_fingerprint} wall profile") if sp.codec_fingerprint else _c(C.GREEN, "✓ cutoff matches no known encoder wall")
-            if sp.resample_detected: res_val = _c(C.RED, f"⚠ {sp.resample_detected}")
-            elif sp.fake_hires: res_val = _c(C.ORANGE, f"⚠ fake hi-res — {sp.fake_hires} (upsampled; codec lowpass erased the Nyquist tell)")
-            else: res_val = _c(C.GREEN, "✓ no foreign-Nyquist resampler artifacts")
+            hdr = _mrow("Header Integrity", "header/stream mismatch — forged or truncated", "", "bad") if hdr_mm else _mrow("Header Integrity", "container matches decoded stream", "", "ok")
+            fp = _mrow("Codec Fingerprint", f"{sp.codec_fingerprint} wall profile", "", "bad") if sp.codec_fingerprint else _mrow("Codec Fingerprint", "cutoff matches no known encoder wall", "", "ok")
+            if sp.resample_detected: res = _mrow("Resample Check", sp.resample_detected, "", "bad")
+            elif sp.fake_hires: res = _mrow("Resample Check", f"fake hi-res — {sp.fake_hires}", "(upsampled; codec lowpass erased the Nyquist tell)", "warn")
+            else: res = _mrow("Resample Check", "no foreign-Nyquist resampler artifacts", "", "ok")
+            mdct = ""
+            if sp.mdct_quant_score != -1.0 or sp.scipy_available:
+                mdct = _mrow("MDCT Quant. Lattice", "n/a" if sp.mdct_quant_score < 0 else f"{sp.mdct_quant_score:.3f}", sp.mdct_quant_interp, _stat(_mdct_colour(sp.mdct_quant_score)))
             rows_adv = [
-                _kv("Header Integrity", _c(C.RED, "⚠ header/stream mismatch — forged or truncated") if hdr_mm else _c(C.GREEN, "✓ container matches decoded stream")),
-                _kv("Codec Fingerprint", fp_val),
-                _kv("Resample Check", res_val),
-                _kv("Segment Vote", seg_val),
-                _kv("auCDtect Bound", _c(_bound_colour(sp.auc_avg_bound_freq), f"{sp.auc_avg_bound_freq:,.0f} Hz avg · {sp.auc_prob_bound_freq:,.0f} Hz mode") + "  " + _c(C.GREY, sp.auc_bound_interp)),
-                _kv("HF Phase Entropy", _c(_phase_ent_colour(sp.auc_phase_entropy), f"{sp.auc_phase_entropy:.2f} bits") + "  " + _c(C.GREY, sp.auc_phase_interp)),
-                _kv("Spectral Sparsity", _c(_sparsity_colour(sp.spectral_sparsity), f"{sp.spectral_sparsity:.3f}") + "  " + _c(C.GREY, sp.sparsity_interp)),
-                _kv("Ultrasonic Corr.", _c(_ultra_corr_colour(sp.hf_envelope_correlation), f"{sp.hf_envelope_correlation:+.2f}") + "  " + _c(C.GREY, sp.hf_env_corr_interp)),
-                _kv("Pre-Echo", _c(_preecho_colour(sp.preecho_pct), f"{sp.preecho_pct:.1f}% of transients") + "  " + _c(C.GREY, "[MDCT block smearing]")),
-                _kv("HF Aliasing Corr.", _c(_aliasing_colour(sp.aliasing_corr), f"{sp.aliasing_corr:.2f}") + "  " + _c(C.GREY, "[codec filterbank mirroring]")),
-                _kv("MP3 Subband Comb", _c(C.ORANGE, "⚠ 689 Hz comb structure detected") if sp.mp3_noise_pattern_detected else _c(C.GREEN, "✓ none")),
-                _kv("Silence Dither", sil_val),
-                _kv("Vinyl Source", vinyl_val),
-                _kv("Cassette Source", cass_val),
+                hdr, fp, res, seg,
+                _mrow("auCDtect Bound", f"{sp.auc_avg_bound_freq:,.0f} Hz avg · {sp.auc_prob_bound_freq:,.0f} Hz mode", sp.auc_bound_interp, _stat(_bound_colour(sp.auc_avg_bound_freq))),
+                _mrow("HF Phase Entropy", f"{sp.auc_phase_entropy:.2f} bits", sp.auc_phase_interp, _stat(_phase_ent_colour(sp.auc_phase_entropy))),
+                mdct,
+                _mrow("Spectral Sparsity", f"{sp.spectral_sparsity:.3f}", sp.sparsity_interp, _stat(_sparsity_colour(sp.spectral_sparsity))),
+                _mrow("Ultrasonic Corr.", f"{sp.hf_envelope_correlation:+.2f}", sp.hf_env_corr_interp, _stat(_ultra_corr_colour(sp.hf_envelope_correlation))),
+                _mrow("Pre-Echo", f"{sp.preecho_pct:.1f}% of transients", "[MDCT block smearing]", _stat(_preecho_colour(sp.preecho_pct))),
+                _mrow("HF Aliasing Corr.", f"{sp.aliasing_corr:.2f}", "[codec filterbank mirroring]", _stat(_aliasing_colour(sp.aliasing_corr))),
+                _mrow("MP3 Subband Comb", "689 Hz comb structure detected", "", "warn") if sp.mp3_noise_pattern_detected else _mrow("MP3 Subband Comb", "none", "", "ok"),
+                sil, vinyl, cass,
             ]
             for row in rows_adv:
                 if row: print(row)
             if sp.segment_map:
-                print(f"    {_c(C.ORANGE, '⚠ Partially transcoded regions:')}")
+                print(f"\n    {_c(C.ORANGE, '⚠ Partially transcoded regions')}")
                 for seg_line in sp.segment_map[:6]:
-                    print(f"      {_c(C.GREY, '→')} {_c(C.WHITE, seg_line)}")
+                    print(f"      {_c(C.ORANGE, '→')} {_c(C.WHITE, seg_line)}")
         else:
             print(f"  {_c(C.YELLOW, '⚠ scipy not installed — advanced forensic suite skipped (pip install scipy)')}")
 
@@ -2294,27 +2688,38 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     if auth.vinyl_rip_detected: source_flags.append("vinyl")
     bd_text = auth.bit_depth_authentic
     # Any transcode/upsample chain repopulates the low-order bits (float decode +
-    # re-quantization, or resampling interpolation), so the trailing-zero pass is
-    # blind to the source depth. Don't render it as a confident green "Verified"
-    # pass — that contradicts the lossy/upscale finding above. Keyed on its own
-    # broad condition (resample OR fake-hi-res OR a decided lossy verdict) so a
-    # green "Verified" never appears on a file the engine already called fake,
-    # independent of the bandwidth detector's own thresholds.
+    # re-quantization, or resampling interpolation), so used-bits analysis is blind
+    # to the source depth and the noise floor (if exposed at all) is the encoder's,
+    # not the source's. Don't render a green pass — that contradicts the lossy/upscale
+    # finding above. Keyed on its own broad condition (resample OR fake-hi-res OR a
+    # decided lossy verdict) so a green never appears on a file the engine already
+    # called fake, independent of the bit-depth prongs' own thresholds.
     bits_regenerated = bool(sp and bd_text.startswith("✓") and (
         sp.resample_detected or sp.fake_hires or sp.verdict_label in ("SUSPICIOUS", "LIKELY_LOSSY")))
     if bits_regenerated:
-        depth = bd_text.split(" — ")[0].replace("✓ Verified ", "")
+        m = re.search(r"(\d+)-bit", bd_text)
+        depth = f"{m.group(1)}-bit" if m else "Claimed depth"
         bd_text = f"~ {depth} container full, but source depth unverifiable on a transcoded/upsampled stream"
-    bd_col = (C.RED if bd_text.startswith("⚠") else C.GREEN if bd_text.startswith("✓")
-              else C.ORANGE if bits_regenerated else C.WHITE)
-    bd_val = _c(bd_col, bd_text)
     if bits_regenerated:
-        bd_val += _c(C.GREY, " — interpolation/requantization regenerates the low-order bits")
-    for row in [_kv("Bit-Depth Auth", bd_val), _kv("Header Integrity", auth.header_integrity), _kv("Encoder Trace", _c(C.RED, auth.encoder_trace) if auth.encoder_trace else ""), _kv("MQA", _c(C.ORANGE, "⚠ MQA-encoded — folded payload not verifiable by PCM analysis") if auth.mqa_detected else ""), _kv("Analog Source", _c(C.BLUE, " + ".join(source_flags) + " signature detected") if source_flags else ""), _kv("Side Channel", auth.side_channel_analysis), _kv("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}" if auth.phase_correlation else ""), _kv("Clipping", auth.clipping_verdict if auth.clipping_verdict else ""), _kv("Silence", auth.silence_total_pct)]:
+        bd_status, bd_interp = "warn", "interpolation/requantization regenerates the low-order bits"
+    elif bd_text.startswith("⚠"): bd_status, bd_interp = "bad", ""
+    elif bd_text.startswith("✓"): bd_status, bd_interp = "ok", ""
+    else: bd_status, bd_interp = "data", ""
+    si_rows = [_mrow("Bit-Depth Auth", _degl(bd_text), bd_interp, bd_status)]
+    hi = auth.header_integrity
+    if hi: si_rows.append(_mrow("Header Integrity", _degl(hi), "", "ok" if hi.startswith("✓") else "data"))
+    if auth.encoder_trace: si_rows.append(_mrow("Encoder Trace", auth.encoder_trace, "", "bad"))
+    if auth.mqa_detected: si_rows.append(_mrow("MQA", "MQA-encoded — folded payload not verifiable by PCM analysis", "", "warn"))
+    if source_flags: si_rows.append(_mrow("Analog Source", " + ".join(source_flags) + " signature detected", "", "info"))
+    if auth.side_channel_analysis: si_rows.append(_mrow("Side Channel", auth.side_channel_analysis, "", "data"))
+    if auth.phase_correlation: si_rows.append(_mrow("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}", "", "data"))
+    if auth.clipping_verdict: si_rows.append(_mrow("Clipping", _degl(auth.clipping_verdict), "", "ok" if auth.clipping_verdict.startswith("✓") else "warn"))
+    if auth.silence_total_pct: si_rows.append(_mrow("Silence", auth.silence_total_pct, "", "data"))
+    for row in si_rows:
         if row: print(row)
     if auth.silence_sections:
-        for s in auth.silence_sections[:4]: print(f"    {_c(C.GREY, '→')} {_c(C.DIM + C.WHITE, s)}")
-        if len(auth.silence_sections) > 4: print(f"    {_c(C.GREY, f'... +{len(auth.silence_sections)-4} more sections')}")
+        for s in auth.silence_sections[:4]: print(f"      {_c(C.GREY, '→')} {_c(C.DIM + C.WHITE, s)}")
+        if len(auth.silence_sections) > 4: print(f"      {_c(C.GREY, f'… +{len(auth.silence_sections)-4} more sections')}")
 
     print(_subsection("ReplayGain Audit"))
     if auth.rg_stored:
