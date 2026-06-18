@@ -4,6 +4,7 @@ Alfred — Audio Forensics Telegram Interface
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 
-from af2 import build_report, build_info_report, ForensicReport, generate_spectrogram
+from af2 import build_report, build_info_report, ForensicReport, generate_spectrogram, compare_reports
 from utils import progress_callback, safe_edit, safe_delete
 import health
 import cue_split
@@ -50,6 +51,7 @@ except json.JSONDecodeError:
 ALLOWED_TOPICS: set = set(json.loads(os.getenv("ALLOWED_TOPICS", "[]")))
 ADMIN_IDS: set[int] = set(json.loads(os.getenv("ADMIN_IDS", "[]")))
 MAX_FILE_SIZE_MB = 1500
+COMPARE_TIMEOUT_SEC = 30
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -85,6 +87,7 @@ _user_queue_counts: defaultdict[int, int] = defaultdict(int)
 MAX_QUEUE_PER_USER = 5
 MAX_CONCURRENT_JOBS = 4
 _active_jobs: dict[str, dict] = {}
+_compare_sessions: dict[tuple[int, int, int], dict] = {}
 
 # Live status boards — one per (chat_id, thread_id)
 # { (chat_id, thread_id): {"msg_id": int, "last_text": str} }
@@ -165,6 +168,84 @@ def verdict_oneliner(report: ForensicReport) -> str:
         return ""
     glyph, label = _VERDICT_BANNER.get(sp.verdict_label, ("·", sp.verdict_label.replace("_", " ")))
     return f"{glyph} {label} · {sp.main_score}/100"
+
+def _compare_session_key(message: Message) -> tuple[int, int, int]:
+    return (message.chat.id, message.message_thread_id or 0, message.from_user.id)
+
+def _compare_buttons(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Cancel", callback_data=f"cmp:cancel:{session_id}"),
+        InlineKeyboardButton("Complete", callback_data=f"cmp:complete:{session_id}"),
+    ]])
+
+def _audio_file_obj(message: Message):
+    return message.audio or message.voice or message.document
+
+def _is_supported_audio_message(message: Message) -> bool:
+    file_obj = _audio_file_obj(message)
+    if not file_obj:
+        return False
+    if message.document:
+        filename = (getattr(message.document, "file_name", "") or "").lower()
+        valid_exts = (".flac", ".alac", ".wav", ".aiff", ".aif", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".dsf", ".dff")
+        return not filename or filename.endswith(valid_exts)
+    return True
+
+def _format_compare_result(reports: list[ForensicReport]) -> str:
+    ordered = compare_reports(reports)
+    if not ordered:
+        return "❌ <b>No reports were generated.</b>"
+
+    lines = [f"<b>Variant Comparison</b> · <code>{len(ordered)} files</code>", ""]
+    for idx, report in enumerate(ordered, 1):
+        sp = report.authenticity.spectral
+        winner = "★ " if idx == 1 else ""
+        filename = html.escape(report.filepath.name)
+        try:
+            sr = f"{int(str(report.technical.sample_rate).strip()) / 1000:g}k"
+        except (ValueError, TypeError):
+            sr = "?"
+        depth = report.technical.precision.replace("-bit", "").strip() or "?"
+        cutoff = f"{sp.cutoff_hz / 1000:.1f}k" if sp and sp.cutoff_hz > 0 else "--"
+        score = str(sp.main_score) if sp and sp.verdict_label != "INCONCLUSIVE" else "--"
+        verdict = html.escape(sp.verdict_label.replace("_", " ") if sp else "INCONCLUSIVE")
+        codec = html.escape(sp.codec_fingerprint if sp and sp.codec_fingerprint else "—")
+        lines.append(
+            f"{idx}. {winner}<b>{filename}</b>\n"
+            f"   <code>{depth}/{sr}</code> · cutoff <code>{cutoff}</code> · DR <code>{report.dr_score}</code> · Main <code>{score}</code>\n"
+            f"   {verdict} · codec <code>{codec}</code>"
+        )
+
+    best = ordered[0]
+    bsp = best.authenticity.spectral
+    best_tag = f"Main {bsp.main_score} · {bsp.verdict_label.replace('_', ' ')}" if bsp and bsp.verdict_label != "INCONCLUSIVE" else "INCONCLUSIVE"
+    lines.extend([
+        "",
+        f"★ <b>Most authentic:</b> <code>{html.escape(best.filepath.name)}</code> ({html.escape(best_tag)})",
+        "<i>Ranking assumes these are variants of the same track.</i>",
+    ])
+    return "\n".join(lines)
+
+async def _expire_compare_session(key: tuple[int, int, int], session_id: str) -> None:
+    await asyncio.sleep(COMPARE_TIMEOUT_SEC)
+    session = _compare_sessions.get(key)
+    if not session or session["id"] != session_id:
+        return
+    _compare_sessions.pop(key, None)
+    prompt = session.get("prompt")
+    if prompt:
+        try:
+            await prompt.edit_text("⌛ <b>Compare cancelled.</b> No completion received within 30 seconds.", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+def _clear_compare_session(key: tuple[int, int, int]) -> Optional[dict]:
+    session = _compare_sessions.pop(key, None)
+    if session:
+        task = session.get("timer_task")
+        if task:
+            task.cancel()
+    return session
 
 def _khz_label(sr: str) -> str:
     try:
@@ -640,6 +721,11 @@ async def _queue_worker():
                 import cue_split
                 run_task = asyncio.create_task(cue_split._run_cue_job(job))
 
+            elif job_type == "cmp":
+                per_job_msg = await job["origin_message"].reply("⚙️ <b>Preparing comparison...</b>", parse_mode=ParseMode.HTML, quote=True)
+                job["status_msg"] = per_job_msg
+                run_task = asyncio.create_task(_run_compare_job(job))
+
         except Exception:
             logger.exception("Queue worker: failed to create per-job status message")
 
@@ -818,6 +904,59 @@ async def _run_forensic_job(job: dict):
         if spec_path and spec_path.exists():
             spec_path.unlink(missing_ok=True)
 
+async def _run_compare_job(job: dict):
+    """Download collected audio files and rank variants using the forensic engine."""
+    client = job["client"]
+    messages: list[Message] = job["messages"]
+    origin_message: Message = job["origin_message"]
+    status_msg: Optional[Message] = job.get("status_msg")
+    job_id = job.get("job_id")
+
+    downloaded: list[Path] = []
+    try:
+        reports: list[ForensicReport] = []
+        total = len(messages)
+        for idx, media_msg in enumerate(messages, 1):
+            file_obj = _audio_file_obj(media_msg)
+            filename = getattr(file_obj, "file_name", f"audio_{idx}") or f"audio_{idx}"
+            _set_job_status(job_id, f"📥 Downloading {idx}/{total}...")
+            await safe_edit(status_msg, f"📥 <b>Downloading</b> <code>{idx}/{total}</code>\n<code>{filename}</code>", parse_mode=ParseMode.HTML)
+
+            file_size_mb = getattr(file_obj, "file_size", 0) / (1024 * 1024)
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                raise ValueError(f"{filename} exceeds the {MAX_FILE_SIZE_MB} MB limit")
+
+            file_path_str = await client.download_media(
+                message=media_msg,
+                file_name="/tmp/downloads/",
+                progress=progress_callback,
+                progress_args=(status_msg, f"Downloading {idx}/{total}", time.time(), [0.0], job_id),
+            )
+            if not file_path_str:
+                raise ValueError(f"Download failed for {filename}")
+            path = Path(file_path_str)
+            downloaded.append(path)
+
+            _set_job_status(job_id, f"🔬 Analysing {idx}/{total}...")
+            await safe_edit(status_msg, f"🔬 <b>Analysing</b> <code>{idx}/{total}</code>\n<code>{filename}</code>", parse_mode=ParseMode.HTML)
+            report = await asyncio.wait_for(asyncio.to_thread(build_report, path), timeout=300)
+            reports.append(report)
+
+        _set_job_status(job_id, "🧮 Comparing...")
+        await safe_edit(status_msg, "🧮 <b>Ranking variants...</b>", parse_mode=ParseMode.HTML)
+        result_text = _format_compare_result(reports)
+        await safe_edit(status_msg, result_text, parse_mode=ParseMode.HTML)
+
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌ <b>Comparison timed out.</b> One of the files may be too long.", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.exception("Compare error")
+        await safe_edit(status_msg, f"❌ <b>Compare failed:</b> {e}", parse_mode=ParseMode.HTML)
+    finally:
+        for path in downloaded:
+            if path.exists():
+                path.unlink(missing_ok=True)
+
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
@@ -843,6 +982,8 @@ async def help_command(client: Client, message: Message):
         "  <code>/fs -info</code> — Text info + assessment (no spectrogram)\n"
         "  <code>/fs -na</code> — Info + spectrogram, no assessment\n"
         "  <code>/fs -nas</code> — Text info only, no assessment, no spectrogram\n\n"
+        "<b>Comparison</b>\n"
+        "  <code>/compare</code> — Collect variants for 30 seconds, then rank the most authentic\n\n"
         "<b>CUE Splitting</b>\n"
         "  <code>/cue</code> — Reply to an audio file to split via CUE sheet\n\n"
         "<b>Audio Conversion</b>\n"
@@ -1003,6 +1144,77 @@ def _parse_fs_flags(args: list[str]) -> dict:
     # default: full
     return {"spec": True, "info": True, "assessment": True}
 
+@app.on_message(filters.command("compare"))
+async def compare_command(client: Client, message: Message):
+    if not _check_auth(message):
+        await _reject_auth(message)
+        return
+
+    key = _compare_session_key(message)
+    existing = _clear_compare_session(key)
+    if existing and existing.get("prompt"):
+        try:
+            await existing["prompt"].edit_text("🛑 <b>Previous compare session replaced.</b>", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+    session_id = uuid.uuid4().hex[:8]
+    prompt = await message.reply(
+        "Send the files you want to compare, then click <b>Complete</b> when done.",
+        parse_mode=ParseMode.HTML,
+        quote=True,
+        reply_markup=_compare_buttons(session_id),
+    )
+    _compare_sessions[key] = {
+        "id": session_id,
+        "origin_message": message,
+        "prompt": prompt,
+        "messages": [],
+        "timer_task": asyncio.create_task(_expire_compare_session(key, session_id)),
+    }
+
+@app.on_callback_query(filters.regex(r"^cmp:(cancel|complete):([a-f0-9]{8})$"))
+async def compare_callback(client: Client, query: CallbackQuery):
+    action = query.matches[0].group(1)
+    session_id = query.matches[0].group(2)
+    msg = query.message
+    key = (msg.chat.id, msg.message_thread_id or 0, query.from_user.id)
+    session = _compare_sessions.get(key)
+
+    if not session or session["id"] != session_id:
+        await query.answer("This compare session is no longer active.", show_alert=True)
+        return
+
+    if action == "cancel":
+        _clear_compare_session(key)
+        await query.answer("Cancelled.")
+        await msg.edit_text("🛑 <b>Compare cancelled.</b>", parse_mode=ParseMode.HTML)
+        return
+
+    messages = list(session.get("messages", []))
+    if len(messages) < 2:
+        await query.answer("Send at least two audio files first.", show_alert=True)
+        return
+
+    _clear_compare_session(key)
+    await query.answer("Comparison queued.")
+    await msg.edit_text(f"✅ <b>Compare queued.</b> <code>{len(messages)}</code> files captured.", parse_mode=ParseMode.HTML)
+
+    names = []
+    for media_msg in messages:
+        file_obj = _audio_file_obj(media_msg)
+        names.append(getattr(file_obj, "file_name", "audio") or "audio")
+
+    job = {
+        "type": "cmp",
+        "user_id": query.from_user.id,
+        "filename": f"{len(messages)} variants",
+        "origin_message": session["origin_message"],
+        "messages": messages,
+        "captured_names": names,
+    }
+    await enqueue_universal_task(job, query)
+
 @app.on_message(filters.command(["forensic", "fs"]))
 async def forensic_command(client: Client, message: Message):
     if not _check_auth(message):
@@ -1059,9 +1271,29 @@ async def cuesplit_command(client: Client, message: Message):
         return
     await cue_split.handle_cuesplit_command(client, message)
 
-@app.on_message(filters.document | filters.photo)
+@app.on_message(filters.audio | filters.voice | filters.document | filters.photo)
 async def cue_interceptor(client: Client, message: Message):
-    """Intercept document/photo messages for CUE state machine."""
+    """Intercept uploads for active compare and CUE state machines."""
+    if message.from_user:
+        key = _compare_session_key(message)
+        session = _compare_sessions.get(key)
+        if session:
+            if _is_supported_audio_message(message):
+                session["messages"].append(message)
+                count = len(session["messages"])
+                prompt = session.get("prompt")
+                if prompt:
+                    try:
+                        await prompt.edit_text(
+                            f"Send the files you want to compare, then click <b>Complete</b> when done.\n\n"
+                            f"Captured: <code>{count}</code>",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=_compare_buttons(session["id"]),
+                        )
+                    except Exception:
+                        pass
+            return
+
     job = await cue_split.check_and_process_cue_upload(client, message)
     if isinstance(job, dict):
         await enqueue_universal_task(job, message)

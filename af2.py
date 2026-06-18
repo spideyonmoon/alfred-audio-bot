@@ -2795,6 +2795,103 @@ def print_batch_summary(reports: list[ForensicReport]) -> None:
             for name, dr in outliers: print(f"    {_c(C.GREY, '→')} {name}  DR{dr}")
     print()
 
+def _bitdepth_confidence(s: str) -> int:
+    # Lower is better: 0 = genuine/confirmed, 1 = abstain/analog-consistent, 2 = flagged.
+    if "⚠" in s: return 2
+    if "~" in s: return 1
+    return 0
+
+def _dr_int(s: str) -> int:
+    try: return int(s.replace("DR", "").strip())
+    except (ValueError, AttributeError): return -1
+
+def _container_quality(tech: AudioTechnical) -> int:
+    try: depth = int(tech.precision.replace("-bit", "").strip())
+    except (ValueError, AttributeError): depth = 0
+    try: sr = int(str(tech.sample_rate).strip())
+    except (ValueError, AttributeError): sr = 0
+    return depth * sr
+
+def _container_str(tech: AudioTechnical) -> str:
+    depth = tech.precision.replace("-bit", "").strip() or "?"
+    try: sr = f"{int(str(tech.sample_rate).strip()) / 1000:g}k"
+    except (ValueError, AttributeError): sr = "?"
+    return f"{depth}/{sr}"
+
+def _compare_key(r: ForensicReport):
+    sp = r.authenticity.spectral
+    inconclusive = sp is None or sp.verdict_label == "INCONCLUSIVE"
+    main = sp.main_score if (sp and not inconclusive) else 999
+    fake = 1 if (sp and (sp.resample_detected or sp.fake_hires)) else 0
+    cutoff = sp.cutoff_hz if sp else 0.0
+    bd = _bitdepth_confidence(r.authenticity.bit_depth_authentic or "")
+    dr = _dr_int(r.dr_score)
+    container = _container_quality(r.technical)
+    # Ascending sort: lowest main score wins; ties prefer bandwidth, bit-depth
+    # confidence, dynamic range, then container capability.
+    return (1 if inconclusive else 0, main, fake, -cutoff, bd, -dr, -container)
+
+def compare_reports(reports: list[ForensicReport]) -> list[ForensicReport]:
+    """Rank variants of the same track from most to least authentic."""
+    return sorted(reports, key=_compare_key)
+
+def comparison_to_dict(reports: list[ForensicReport]) -> dict:
+    ordered = compare_reports(reports)
+    ranking = []
+    for i, r in enumerate(ordered):
+        sp = r.authenticity.spectral
+        ranking.append({
+            "rank": i + 1, "winner": i == 0,
+            "file": str(r.filepath), "name": r.filepath.name,
+            "container": _container_str(r.technical),
+            "main_score": (sp.main_score if sp and sp.verdict_label != "INCONCLUSIVE" else None),
+            "verdict": (sp.verdict_label if sp else "INCONCLUSIVE"),
+            "cutoff_hz": (sp.cutoff_hz if sp else 0.0),
+            "codec_fingerprint": (sp.codec_fingerprint if sp else ""),
+            "bit_depth": r.authenticity.bit_depth_authentic,
+            "dr_score": r.dr_score,
+        })
+    return {"winner": ordered[0].filepath.name if ordered else None, "ranking": ranking}
+
+def print_comparison(reports: list[ForensicReport]) -> None:
+    ordered = compare_reports(reports)
+    W = 92
+    print(); print(_rule("═", W))
+    print(f"  {_c(C.BOLD + C.WHITE, f'VARIANT COMPARISON  ·  {len(ordered)} files')}")
+    print(_rule("═", W))
+    cw = [30, 8, 8, 14, 5, 5]
+    header = (f"  {_c(C.GOLD, 'Variant'.ljust(cw[0]))} {_c(C.GOLD, 'Format'.ljust(cw[1]))} "
+              f"{_c(C.GOLD, 'Cutoff'.ljust(cw[2]))} {_c(C.GOLD, 'Codec'.ljust(cw[3]))} "
+              f"{_c(C.GOLD, 'DR'.ljust(cw[4]))} {_c(C.GOLD, 'Main'.ljust(cw[5]))} {_c(C.GOLD, 'Verdict')}")
+    print(header); print(_rule("─", W))
+    for i, r in enumerate(ordered):
+        sp = r.authenticity.spectral
+        win = i == 0
+        cell = (("★ " if win else "  ") + r.filepath.name)[: cw[0] + 2].ljust(cw[0] + 2)
+        name = (_c(C.GOLD, cell[:2]) + _c(C.WHITE, cell[2:])) if win else _c(C.WHITE, cell)
+        fmt = _container_str(r.technical).ljust(cw[1])
+        if sp and sp.cutoff_hz > 0:
+            cut = _c(_bound_colour(sp.cutoff_hz), f"{sp.cutoff_hz / 1000:.1f}k".ljust(cw[2]))
+        else:
+            cut = "--".ljust(cw[2])
+        codec = (sp.codec_fingerprint if sp and sp.codec_fingerprint else "—")[: cw[3]].ljust(cw[3])
+        dr = _c(_dr_assessment(r.dr_score)[0], r.dr_score.ljust(cw[4]))
+        if sp and sp.verdict_label != "INCONCLUSIVE":
+            ms = _c(_main_score_colour(sp.main_score), str(sp.main_score).ljust(cw[5]))
+            vlbl = sp.verdict_label
+        else:
+            ms = "--".ljust(cw[5]); vlbl = "INCONCLUSIVE"
+        glyph = _VERDICT_GLYPH.get(vlbl, "·"); vcol = _VERDICT_COL.get(vlbl, C.WHITE)
+        verdict = _c(vcol, f"{glyph} {vlbl}")
+        line = f"  {name} {_c(C.GREY, fmt)} {cut} {_c(C.DIM + C.WHITE, codec)} {dr} {ms} {verdict}"
+        print(line)
+    print(_rule("─", W))
+    best = ordered[0]; bsp = best.authenticity.spectral
+    tag = f"Main {bsp.main_score} · {bsp.verdict_label}" if bsp and bsp.verdict_label != "INCONCLUSIVE" else "INCONCLUSIVE"
+    print(f"\n  {_c(C.GOLD, '★ Most authentic:')} {_c(C.WHITE, best.filepath.name)}  {_c(C.GREY, tag)}")
+    print(f"  {_c(C.DIM + C.WHITE, 'Ranking assumes these are variants of the SAME track; unrelated files produce a meaningless order.')}")
+    print()
+
 def main() -> None:
     # Windows pipes default to cp1252, which cannot encode the report's box-drawing
     # and verdict glyphs — redirecting output would crash with UnicodeEncodeError.
@@ -2809,6 +2906,7 @@ def main() -> None:
     parser.add_argument("--fast", action="store_true", help="Analyse first 60s only")
     parser.add_argument("--info", action="store_true", help="Only show basic metadata")
     parser.add_argument("--workers", type=int, default=0, help="Concurrent files in batch mode (default: auto, up to 3)")
+    parser.add_argument("--compare", action="store_true", help="Rank multiple variants of the SAME track and pick the most authentic")
     args = parser.parse_args()
 
     missing = [t for t in ("ffmpeg", "sox", "mediainfo") if not _tool_available(t)]
@@ -2824,6 +2922,9 @@ def main() -> None:
     if missing_paths:
         for p in missing_paths: print(f"Error: not found — {p}", file=sys.stderr)
         sys.exit(1)
+
+    if args.compare and len(paths) < 2:
+        print("Error: --compare needs at least 2 files to rank", file=sys.stderr); sys.exit(1)
 
     if args.info:
         reports = [build_info_report(p) for p in paths]
@@ -2842,11 +2943,19 @@ def main() -> None:
         reports = [build_report(p, fast_secs=fast) for p in paths]
     _Status.clear()
     if args.json:
-        print(json.dumps([_report_to_dict(r) for r in reports], indent=2, default=str))
+        if args.compare:
+            payload = {"comparison": comparison_to_dict(reports),
+                       "files": [_report_to_dict(r) for r in reports]}
+            print(json.dumps(payload, indent=2, default=str))
+        else:
+            print(json.dumps([_report_to_dict(r) for r in reports], indent=2, default=str))
         return
 
     for report in reports: print_report(report)
-    if len(reports) > 1: print_batch_summary(reports)
+    if args.compare:
+        print_comparison(reports)
+    elif len(reports) > 1:
+        print_batch_summary(reports)
 
 if __name__ == "__main__":
     main()
