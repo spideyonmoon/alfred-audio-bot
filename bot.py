@@ -191,7 +191,27 @@ def _is_supported_audio_message(message: Message) -> bool:
         return not filename or filename.endswith(valid_exts)
     return True
 
-def _format_compare_result(reports: list[ForensicReport]) -> str:
+def _message_link(message: Message) -> str:
+    if getattr(message, "link", None):
+        return message.link
+    username = getattr(message.chat, "username", None)
+    if username:
+        return f"https://t.me/{username}/{message.id}"
+    chat_id = str(message.chat.id)
+    if chat_id.startswith("-100"):
+        return f"https://t.me/c/{chat_id[4:]}/{message.id}"
+    return ""
+
+def _linked_filename(filename: str, source_msg: Optional[Message]) -> str:
+    label = html.escape(filename)
+    if not source_msg:
+        return f"<b>{label}</b>"
+    url = _message_link(source_msg)
+    if not url:
+        return f"<b>{label}</b>"
+    return f'<a href="{html.escape(url, quote=True)}"><b>{label}</b></a>'
+
+def _format_compare_result(reports: list[ForensicReport], sources: Optional[dict[Path, Message]] = None) -> str:
     ordered = compare_reports(reports)
     if not ordered:
         return "❌ <b>No reports were generated.</b>"
@@ -200,7 +220,7 @@ def _format_compare_result(reports: list[ForensicReport]) -> str:
     for idx, report in enumerate(ordered, 1):
         sp = report.authenticity.spectral
         winner = "★ " if idx == 1 else ""
-        filename = html.escape(report.filepath.name)
+        filename = _linked_filename(report.filepath.name, (sources or {}).get(report.filepath))
         try:
             sr = f"{int(str(report.technical.sample_rate).strip()) / 1000:g}k"
         except (ValueError, TypeError):
@@ -211,7 +231,7 @@ def _format_compare_result(reports: list[ForensicReport]) -> str:
         verdict = html.escape(sp.verdict_label.replace("_", " ") if sp else "INCONCLUSIVE")
         codec = html.escape(sp.codec_fingerprint if sp and sp.codec_fingerprint else "—")
         lines.append(
-            f"{idx}. {winner}<b>{filename}</b>\n"
+            f"{idx}. {winner}{filename}\n"
             f"   <code>{depth}/{sr}</code> · cutoff <code>{cutoff}</code> · DR <code>{report.dr_score}</code> · Main <code>{score}</code>\n"
             f"   {verdict} · codec <code>{codec}</code>"
         )
@@ -221,7 +241,7 @@ def _format_compare_result(reports: list[ForensicReport]) -> str:
     best_tag = f"Main {bsp.main_score} · {bsp.verdict_label.replace('_', ' ')}" if bsp and bsp.verdict_label != "INCONCLUSIVE" else "INCONCLUSIVE"
     lines.extend([
         "",
-        f"★ <b>Most authentic:</b> <code>{html.escape(best.filepath.name)}</code> ({html.escape(best_tag)})",
+        f"★ <b>Most authentic:</b> {_linked_filename(best.filepath.name, (sources or {}).get(best.filepath))} ({html.escape(best_tag)})",
         "<i>Ranking assumes these are variants of the same track.</i>",
     ])
     return "\n".join(lines)
@@ -652,8 +672,12 @@ async def enqueue_universal_task(job: dict, ctx):
     # Create or refresh the live board for this (chat, thread)
     key        = (chat_id, thread_id)
     board_text = _render_board(chat_id, thread_id)
+    board_reuse_msg = job.pop("board_message", None)
 
     async def _make_board_msg():
+        if board_reuse_msg is not None:
+            await board_reuse_msg.edit_text(board_text, parse_mode=ParseMode.HTML)
+            return board_reuse_msg
         if isinstance(ctx, CallbackQuery):
             return await app.send_message(
                 chat_id, board_text,
@@ -722,8 +746,7 @@ async def _queue_worker():
                 run_task = asyncio.create_task(cue_split._run_cue_job(job))
 
             elif job_type == "cmp":
-                per_job_msg = await job["origin_message"].reply("⚙️ <b>Preparing comparison...</b>", parse_mode=ParseMode.HTML, quote=True)
-                job["status_msg"] = per_job_msg
+                job["status_msg"] = None
                 run_task = asyncio.create_task(_run_compare_job(job))
 
         except Exception:
@@ -909,18 +932,17 @@ async def _run_compare_job(job: dict):
     client = job["client"]
     messages: list[Message] = job["messages"]
     origin_message: Message = job["origin_message"]
-    status_msg: Optional[Message] = job.get("status_msg")
     job_id = job.get("job_id")
 
     downloaded: list[Path] = []
     try:
         reports: list[ForensicReport] = []
+        sources: dict[Path, Message] = {}
         total = len(messages)
         for idx, media_msg in enumerate(messages, 1):
             file_obj = _audio_file_obj(media_msg)
             filename = getattr(file_obj, "file_name", f"audio_{idx}") or f"audio_{idx}"
             _set_job_status(job_id, f"📥 Downloading {idx}/{total}...")
-            await safe_edit(status_msg, f"📥 <b>Downloading</b> <code>{idx}/{total}</code>\n<code>{filename}</code>", parse_mode=ParseMode.HTML)
 
             file_size_mb = getattr(file_obj, "file_size", 0) / (1024 * 1024)
             if file_size_mb > MAX_FILE_SIZE_MB:
@@ -930,7 +952,7 @@ async def _run_compare_job(job: dict):
                 message=media_msg,
                 file_name="/tmp/downloads/",
                 progress=progress_callback,
-                progress_args=(status_msg, f"Downloading {idx}/{total}", time.time(), [0.0], job_id),
+                progress_args=(None, f"Downloading {idx}/{total}", time.time(), [0.0], job_id),
             )
             if not file_path_str:
                 raise ValueError(f"Download failed for {filename}")
@@ -938,20 +960,19 @@ async def _run_compare_job(job: dict):
             downloaded.append(path)
 
             _set_job_status(job_id, f"🔬 Analysing {idx}/{total}...")
-            await safe_edit(status_msg, f"🔬 <b>Analysing</b> <code>{idx}/{total}</code>\n<code>{filename}</code>", parse_mode=ParseMode.HTML)
             report = await asyncio.wait_for(asyncio.to_thread(build_report, path), timeout=300)
             reports.append(report)
+            sources[report.filepath] = media_msg
 
         _set_job_status(job_id, "🧮 Comparing...")
-        await safe_edit(status_msg, "🧮 <b>Ranking variants...</b>", parse_mode=ParseMode.HTML)
-        result_text = _format_compare_result(reports)
-        await safe_edit(status_msg, result_text, parse_mode=ParseMode.HTML)
+        result_text = _format_compare_result(reports, sources)
+        await origin_message.reply(result_text, parse_mode=ParseMode.HTML, quote=True)
 
     except asyncio.TimeoutError:
-        await safe_edit(status_msg, "❌ <b>Comparison timed out.</b> One of the files may be too long.", parse_mode=ParseMode.HTML)
+        await origin_message.reply("❌ <b>Comparison timed out.</b> One of the files may be too long.", parse_mode=ParseMode.HTML, quote=True)
     except Exception as e:
         logger.exception("Compare error")
-        await safe_edit(status_msg, f"❌ <b>Compare failed:</b> {e}", parse_mode=ParseMode.HTML)
+        await origin_message.reply(f"❌ <b>Compare failed:</b> {html.escape(str(e))}", parse_mode=ParseMode.HTML, quote=True)
     finally:
         for path in downloaded:
             if path.exists():
@@ -1198,7 +1219,6 @@ async def compare_callback(client: Client, query: CallbackQuery):
 
     _clear_compare_session(key)
     await query.answer("Comparison queued.")
-    await msg.edit_text(f"✅ <b>Compare queued.</b> <code>{len(messages)}</code> files captured.", parse_mode=ParseMode.HTML)
 
     names = []
     for media_msg in messages:
@@ -1210,6 +1230,7 @@ async def compare_callback(client: Client, query: CallbackQuery):
         "user_id": query.from_user.id,
         "filename": f"{len(messages)} variants",
         "origin_message": session["origin_message"],
+        "board_message": msg,
         "messages": messages,
         "captured_names": names,
     }
