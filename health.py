@@ -1,9 +1,27 @@
 import asyncio
 import http.server
+import os
 import socketserver
 import logging
 
 logger = logging.getLogger(__name__)
+
+# HuggingFace Spaces' documented app port, used when the platform injects nothing.
+DEFAULT_PORT = 7860
+
+def resolve_port() -> int:
+    """The port this platform expects the app to listen on.
+
+    Render (like Heroku and other PaaS) injects ``PORT`` and routes traffic to it, so a
+    hard-coded port leaves the app unbound from the router's point of view and its health
+    probe fails. HuggingFace Spaces sets no such variable and uses 7860. ``HEALTH_PORT``
+    overrides both for local or manual runs.
+    """
+    for var in ("HEALTH_PORT", "PORT"):
+        raw = os.getenv(var, "").strip()
+        if raw.isdigit():
+            return int(raw)
+    return DEFAULT_PORT
 
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -18,6 +36,8 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(msg.encode('utf-8'))
         else:
+            # Every other path answers 200: platforms probe "/", "/health", or nothing
+            # at all, and each of those just means "is the process up".
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
@@ -33,5 +53,5 @@ def _run_server(port):
         logger.info("Health server listening on 0.0.0.0:%d", port)
         httpd.serve_forever()
 
-async def start_health_server(port: int = 7860):
-    await asyncio.to_thread(_run_server, port)
+async def start_health_server(port: int = 0):
+    await asyncio.to_thread(_run_server, port or resolve_port())

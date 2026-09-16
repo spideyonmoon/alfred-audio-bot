@@ -7,7 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mediainfo \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# HuggingFace Spaces run as a non-root user (uid 1000)
+# Non-root user. HuggingFace Spaces requires uid 1000; Render runs any uid, so the
+# same image works on both.
 RUN useradd -m -u 1000 alfred
 WORKDIR /home/alfred/app
 
@@ -18,7 +19,9 @@ COPY --chown=alfred:alfred . .
 
 USER alfred
 
-# Port 7860 is the expected HuggingFace Spaces health port
+# Informational only: the app binds whatever the platform asks for — $PORT on Render,
+# defaulting to 7860 (HuggingFace Spaces' documented port) when nothing is injected.
+# EXPOSE is not what makes the port reachable on either platform.
 EXPOSE 7860
 
 ENV PYTHONDONTWRITEBYTECODE=1

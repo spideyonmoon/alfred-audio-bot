@@ -61,12 +61,42 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-# On HuggingFace, run purely in-memory to safely isolate Auth Keys from local runs
-is_hf = bool(os.getenv("SPACE_ID"))
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean env var, accepting the usual on/off spellings."""
+    raw = os.getenv(name, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:  return True
+    if raw in {"0", "false", "no", "off"}: return False
+    return default
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Read an integer env var, falling back to `default` if unset or unparseable."""
+    try:
+        return max(minimum, int(os.getenv(name, "").strip()))
+    except (TypeError, ValueError):
+        return default
+
+def _detect_platform() -> str:
+    """Which host we're running on: 'huggingface', 'render', or 'local'.
+
+    Both cloud platforms give the container an ephemeral filesystem, which matters for
+    where the Pyrogram session lives — a `.session` file there is wiped on every redeploy.
+    """
+    if os.getenv("SPACE_ID"): return "huggingface"
+    if any(os.getenv(v) for v in ("RENDER", "RENDER_SERVICE_ID", "RENDER_EXTERNAL_URL")):
+        return "render"
+    return "local"
+
+PLATFORM = _detect_platform()
+# Keep the session in memory on ephemeral-filesystem hosts (see _detect_platform).
+# SESSION_IN_MEMORY=0/1 overrides the detection if a host needs the other behaviour.
+SESSION_IN_MEMORY = _env_flag("SESSION_IN_MEMORY", PLATFORM != "local")
+# Health endpoint: enabled by default everywhere so the platform's port probe — and any
+# uptime pinger — gets an answer. HEALTH_SERVER=0 disables it for local runs.
+HEALTH_SERVER_ENABLED = _env_flag("HEALTH_SERVER", True)
 
 app = Client(
-    name=":memory:" if is_hf else "alfred_session",
-    in_memory=is_hf,
+    name=":memory:" if SESSION_IN_MEMORY else "alfred_session",
+    in_memory=SESSION_IN_MEMORY,
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
@@ -85,7 +115,12 @@ _total_analyses = 0
 _task_queue: asyncio.Queue = asyncio.Queue()
 _user_queue_counts: defaultdict[int, int] = defaultdict(int)
 MAX_QUEUE_PER_USER = 5
-MAX_CONCURRENT_JOBS = 4
+# Concurrent analyses. Each job runs build_report() inside this process, holding the
+# decoded track plus its STFT — roughly 0.5 GB for a full-length track. Four workers
+# therefore want ~2 GB, which gets the container OOM-killed on small instances (Render's
+# free tier gives 512 MB). Default to one so the queue serialises the wait instead of the
+# kernel killing the bot; raise MAX_CONCURRENT_JOBS on a host with the RAM for it.
+MAX_CONCURRENT_JOBS = _env_int("MAX_CONCURRENT_JOBS", 1)
 _active_jobs: dict[str, dict] = {}
 _compare_sessions: dict[tuple[int, int, int], dict] = {}
 
@@ -1352,13 +1387,24 @@ async def _on_start():
     start the client. We must use `async with app:` to start/stop the client,
     then spawn the worker and idle."""
     from pyrogram import idle
-    
-    # On HuggingFace Spaces, SPACE_ID env var is set automatically.
-    # Start the minimal health server IMMEDIATELY so HF startup probes pass
-    # BEFORE Pyrogram blocks to negotiate the MTProto connection to Telegram.
-    if os.getenv("SPACE_ID"):
-        asyncio.create_task(health.start_health_server(port=7860))
-        logger.info("HuggingFace Space detected — health server started on :7860")
+
+    # Start the minimal health server IMMEDIATELY — before Pyrogram blocks negotiating
+    # the MTProto connection to Telegram — so the platform's startup/port probe passes.
+    # Render routes to $PORT; HuggingFace Spaces and local runs use 7860.
+    if HEALTH_SERVER_ENABLED:
+        port = health.resolve_port()
+        asyncio.create_task(health.start_health_server(port=port))
+        logger.info("Platform: %s — health server started on :%d", PLATFORM, port)
+
+    if psutil is not None:
+        # Each analysis needs several hundred MB; surfacing the budget at startup makes a
+        # too-high MAX_CONCURRENT_JOBS obvious before it becomes an OOM kill.
+        try:
+            total_mb = psutil.virtual_memory().total / (1024 * 1024)
+            logger.info("Memory: %.0f MB total, %d concurrent analysis worker(s)",
+                        total_mb, MAX_CONCURRENT_JOBS)
+        except Exception:
+            pass
 
     async with app:
         logger.info("Alfred (MTProto) is now online and standing by.")
@@ -1385,5 +1431,7 @@ if __name__ == "__main__":
                 traceback.print_exc(file=f)
             logger.error("Fatal startup error. Storing traceback to /tmp/crash.log and starting debug health server.")
             async def serve_crash():
-                await health.start_health_server(port=7860)
+                # Keep the port probe answering even while the bot is down, so the
+                # platform's log/health surface stays reachable for debugging.
+                await health.start_health_server()
             asyncio.run(serve_crash())# cache breaker 123
