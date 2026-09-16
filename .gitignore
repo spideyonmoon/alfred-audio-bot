@@ -21,3 +21,6 @@ build/
 
 # AI Context / Documentation
 context.md
+
+# Deployment notes kept on the machine, not in the repository
+DEPLOY_VPS.md

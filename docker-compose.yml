@@ -1,8 +1,30 @@
 services:
   alfred:
     build: .
+    image: alfred-audio-bot
     env_file: .env
+    # Bring the bot back after a crash or a reboot. Note this is not a memory fix:
+    # an out-of-memory kill restarts the container, so if it loops, lower
+    # MAX_CONCURRENT_JOBS in .env (or give the host more RAM / swap).
     restart: unless-stopped
-    volumes:
-      # Persist Pyrogram session file across restarts
-      - .:/app
+
+    # The health endpoint is deliberately NOT published to the host. It answers 200 on
+    # every path and serves the startup traceback at /crash with no authentication, so on
+    # a VPS with a public IP it should stay inside the container network. If you want an
+    # uptime monitor, bind it to loopback only:
+    #
+    #   ports:
+    #     - "127.0.0.1:7860:7860"
+    #
+    # and set HEALTH_PORT=7860 in .env.
+
+    # The previous `- .:/app` volume is gone on purpose: this image's working directory is
+    # /home/alfred/app, so the mount pointed at a path nothing reads, and the comment
+    # beside it ("persist the Pyrogram session") was wrong — the session was never written
+    # there. Mounting the source tree over the app directory would also hand the container
+    # files owned by the host user, which is how the "unable to open database file" startup
+    # crash happens. Updates are `git pull && docker compose up -d --build` instead.
+    #
+    # The session lives inside the container (file-backed when the app directory is
+    # writable, in memory otherwise — see bot.py). Either way a restart costs a few seconds
+    # of re-login with the bot token, which is automatic.
