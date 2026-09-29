@@ -27,6 +27,7 @@ app_port: 7860
 | `/fs -nas` | Text info only, no spectrogram, no assessment |
 | `/cue` | Split a CUE+Audio album into individual tracks |
 | `/cnv [format]` | Convert audio to another format (interactive menu) |
+| `/log` | Verify an EAC/XLD log and identify possible CD releases |
 | `/stats` | Bot status, queue depth, total analyses |
 | `/help` | Full command reference |
 

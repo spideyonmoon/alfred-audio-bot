@@ -33,6 +33,7 @@ from utils import progress_callback, safe_edit, safe_delete
 import health
 import cue_split
 import convert
+from logchecker import fetch_release_candidates, format_logcheck_result
 
 env_path = Path(__file__).parent / ".env"
 load_dotenv(env_path)
@@ -1047,7 +1048,7 @@ async def help_command(client: Client, message: Message):
         "  <i>Reply to an audio file. Omit format for interactive menu.</i>\n"
         "  Supported: <code>flac alac mp3 aac ogg opus wav aiff</code>\n\n"
         "<b>Log Checker</b>\n"
-        "  <code>/log</code> — Check an EAC/XLD rip log for integrity\n\n"
+        "  <code>/log</code> — Verify an EAC/XLD log and identify possible releases\n\n"
         "<b>Utility</b>\n"
         "  <code>/stats</code> — Queue status and bot statistics\n"
         "  <code>/help</code> — This message\n"
@@ -1058,18 +1059,6 @@ async def help_command(client: Client, message: Message):
 # /log — EAC/XLD rip log checker
 # ---------------------------------------------------------------------------
 _LOGCHECK_API = "https://logcheck.nirzak.win/api"
-
-_CHECKSUM_LABELS = {
-    "checksum_ok":       "✅ OK",
-    "checksum_missing":  "⚠ Missing",
-    "checksum_mismatch": "❌ Mismatch",
-}
-
-def _score_emoji(score: int) -> str:
-    if score == 100: return "💯"
-    if score >= 80:  return "🟢"
-    if score >= 50:  return "🟡"
-    return "🔴"
 
 @app.on_message(filters.command("log"))
 async def logcheck_command(client: Client, message: Message):
@@ -1097,37 +1086,39 @@ async def logcheck_command(client: Client, message: Message):
 
         await safe_edit(status_msg, "🔍 <b>Checking log...</b>", parse_mode=ParseMode.HTML)
 
+        release_candidates = []
+        release_lookup_error = False
         async with httpx.AsyncClient(timeout=30.0) as http:
             with open(file_path, "rb") as f:
                 resp = await http.post(_LOGCHECK_API, files={"logfile": (filename, f)})
 
-        if resp.status_code != 200:
-            await safe_edit(status_msg, f"❌ API error: <code>{resp.status_code}</code>", parse_mode=ParseMode.HTML)
-            return
+            if resp.status_code != 200:
+                await safe_edit(status_msg, f"❌ API error: <code>{resp.status_code}</code>", parse_mode=ParseMode.HTML)
+                return
 
-        data = resp.json()
-        score    = data.get("score", "?")
-        ripper   = data.get("ripper", "Unknown")
-        version  = data.get("ripper_version", "")
-        checksum = _CHECKSUM_LABELS.get(data.get("checksum_state", ""), data.get("checksum_state", ""))
-        details  = data.get("details", [])
-        emoji    = _score_emoji(score) if isinstance(score, int) else "❓"
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise ValueError("Log checker returned an invalid response")
 
-        ripper_line = f"{ripper} {version}".strip()
-        details_text = "\n".join(f"  • {d}" for d in details) if details else "  <i>None</i>"
+            if data.get("musicbrainz_id"):
+                await safe_edit(status_msg, "🔎 <b>Finding possible release...</b>", parse_mode=ParseMode.HTML)
+                try:
+                    release_candidates = await fetch_release_candidates(http, data)
+                except (httpx.HTTPError, ValueError, TypeError):
+                    release_lookup_error = True
+                    logger.warning("MusicBrainz release lookup failed", exc_info=True)
 
-        text = (
-            f"<blockquote><b>{filename}</b></blockquote>\n\n"
-            f"{emoji} <b>Score:</b> <code>{score}/100</code>\n"
-            f"🎙 <b>Ripper:</b> <code>{ripper_line}</code>\n"
-            f"🔐 <b>Checksum:</b> {checksum}\n\n"
-            f"<b>Details:</b>\n{details_text}"
+        text = format_logcheck_result(
+            data,
+            filename,
+            release_candidates,
+            release_lookup_error=release_lookup_error,
         )
         await safe_edit(status_msg, text, parse_mode=ParseMode.HTML)
 
     except Exception as e:
         logger.exception("Log check error")
-        await safe_edit(status_msg, f"❌ <b>Error:</b> {e}", parse_mode=ParseMode.HTML)
+        await safe_edit(status_msg, f"❌ <b>Error:</b> {html.escape(str(e))}", parse_mode=ParseMode.HTML)
     finally:
         if file_path and Path(file_path).exists():
             Path(file_path).unlink(missing_ok=True)
