@@ -52,6 +52,10 @@ class ReleaseCandidate:
         return f"https://musicbrainz.org/release/{quote(self.release_id, safe='')}"
 
 
+class RichMessageError(RuntimeError):
+    """A sanitized Bot API failure while publishing a rich log-check report."""
+
+
 def _text(value: Any, default: str = "Unknown") -> str:
     if value is None:
         return default
@@ -304,6 +308,182 @@ def _format_candidate(candidate: ReleaseCandidate, index: int, show_number: bool
         ]
     )
     return "\n".join(lines)
+
+
+def _score_presentation(score: Any) -> tuple[str, str]:
+    if not isinstance(score, int):
+        return "❓", _h(score)
+    if score == 100:
+        return "💯", _h(score)
+    if score >= 80:
+        return "🟢", _h(score)
+    if score >= 50:
+        return "🟡", _h(score)
+    return "🔴", _h(score)
+
+
+def _checksum_presentation(data: dict[str, Any]) -> str:
+    labels = {
+        "checksum_ok": "✅ OK",
+        "checksum_missing": "⚠ Missing",
+        "checksum_mismatch": "❌ Mismatch",
+    }
+    raw = _text(data.get("checksum_state"), "Unknown")
+    return labels.get(raw, _h(raw))
+
+
+def _rich_database_items(data: dict[str, Any]) -> list[str]:
+    """Compact, link-first database rows for a rich-message disclosure."""
+    items: list[str] = []
+    if data.get("musicbrainz_id"):
+        items.append(
+            "<b>MusicBrainz</b> — "
+            f"{_safe_link('Disc ID', data.get('musicbrainz_url'))} "
+            f"<code>{_h(data['musicbrainz_id'])}</code>"
+        )
+    if data.get("ctdb_id"):
+        items.append(
+            "<b>CTDB</b> — "
+            f"{_safe_link('Open record', data.get('ctdb_url'))} "
+            f"<code>{_h(data['ctdb_id'])}</code>"
+        )
+    if data.get("accuraterip_id") or data.get("accuraterip_status"):
+        identifier = f" · <code>{_h(data['accuraterip_id'])}</code>" if data.get("accuraterip_id") else ""
+        items.append(f"<b>AccurateRip</b> — {_status(data.get('accuraterip_status'))}{identifier}")
+    if data.get("freedb_id"):
+        items.append(f"<b>FreeDB</b> — <code>{_h(data['freedb_id'])}</code>")
+    if data.get("gnudb_id") or data.get("gnudb_status") or data.get("gnudb_title"):
+        link = _safe_link('Open record', data.get('gnudb_url')) if data.get("gnudb_id") else ""
+        title = f" · <i>{_h(data['gnudb_title'])}</i>" if data.get("gnudb_title") else ""
+        items.append(f"<b>gnudb</b> — {_status(data.get('gnudb_status'))}" + (f" · {link}" if link else "") + title)
+    return items
+
+
+def _rich_candidate_card(candidate: ReleaseCandidate, index: int, is_open: bool) -> str:
+    place = candidate.area or candidate.country
+    if candidate.area and candidate.country:
+        place = f"{candidate.area} ({candidate.country})"
+    match = "Exact Disc ID match" if candidate.exact_toc else "Fuzzy TOC match"
+    labels = "; ".join(f"{label} · Cat# {catalog}" for label, catalog in candidate.labels) or "None listed"
+    media = " · ".join(candidate.media) or "Unknown format"
+    open_attribute = " open" if is_open else ""
+    place_text = f" · {_h(place)}" if place else ""
+
+    return (
+        f"<details{open_attribute}><summary><b>{index}. {_h(candidate.artist)} — {_h(candidate.title)}</b>"
+        f" · {_h(candidate.date)}{place_text}</summary>"
+        "<table compact>"
+        f"<tr><td><b>Match</b></td><td>{_h(match)}</td></tr>"
+        f"<tr><td><b>Format</b></td><td>{_h(media)}</td></tr>"
+        f"<tr><td><b>Label</b></td><td>{_h(labels)}</td></tr>"
+        f"<tr><td><b>Barcode</b></td><td><code>{_h(candidate.barcode)}</code></td></tr>"
+        f"<tr><td><b>Edition</b></td><td>{_h(candidate.packaging)} · {_h(candidate.status)}</td></tr>"
+        "</table>"
+        f"<p>{_safe_link('View this release on MusicBrainz', candidate.url)}</p>"
+        "</details>"
+    )
+
+
+def build_rich_logcheck_message(
+    data: dict[str, Any],
+    filename: str,
+    candidates: list[ReleaseCandidate] | None = None,
+    release_lookup_error: bool = False,
+) -> dict[str, Any]:
+    """Build a compact Bot API InputRichMessage for a /log result.
+
+    The summary is intentionally short; IDs and alternative pressings live in
+    native disclosure blocks so a report remains readable even with many matches.
+    """
+    candidates = candidates or []
+    score_emoji, score_text = _score_presentation(data.get("score", "?"))
+    ripper = " ".join(
+        value for value in (_text(data.get("ripper"), "Unknown"), _text(data.get("ripper_version"), "")) if value
+    )
+    combined = "Combined log" if data.get("is_combined_log") is True else "Single-disc log" if data.get("is_combined_log") is False else "Log type unknown"
+    details = data.get("details")
+
+    blocks = [
+        "<h3>Rip log report</h3>",
+        f"<blockquote><b>{_h(filename)}</b><br/>{_h(ripper)} · {_h(data.get('language'))} · {combined}</blockquote>",
+        "<table compact><caption>Integrity</caption>"
+        f"<tr><td><b>Score</b></td><td>{score_emoji} <mark>{score_text} / 100</mark></td></tr>"
+        f"<tr><td><b>Checksum</b></td><td>{_checksum_presentation(data)}</td></tr>"
+        "</table>",
+    ]
+
+    if isinstance(details, list) and details:
+        detail_html = "".join(f"<li>{_h(detail)}</li>" for detail in details)
+        blocks.append(f"<details><summary><b>Checker details</b> · {len(details)}</summary><ul>{detail_html}</ul></details>")
+    elif details:
+        blocks.append(f"<details><summary><b>Checker details</b></summary><p>{_h(details)}</p></details>")
+
+    database_items = _rich_database_items(data)
+    if database_items:
+        blocks.append(
+            "<details><summary><b>Database checks</b> · "
+            f"{len(database_items)} sources</summary><ul>"
+            + "".join(f"<li>{item}</li>" for item in database_items)
+            + "</ul></details>"
+        )
+
+    blocks.append("<hr/>")
+    if candidates:
+        exact_count = sum(candidate.exact_toc for candidate in candidates)
+        heading = "Release candidate" if len(candidates) == 1 else f"Release candidates · {len(candidates)}"
+        blocks.append(f"<h4>{heading}</h4>")
+        for index, candidate in enumerate(candidates[:MAX_RENDERED_CANDIDATES], start=1):
+            blocks.append(_rich_candidate_card(candidate, index, is_open=index == 1 and candidate.exact_toc))
+        remaining = len(candidates) - MAX_RENDERED_CANDIDATES
+        if remaining > 0:
+            blocks.append(f"<p><i>{remaining} more candidate(s) are available on MusicBrainz.</i></p>")
+        match_note = "Exact Disc ID match" if exact_count else "Fuzzy TOC match"
+        if exact_count and exact_count != len(candidates):
+            match_note += f" for {exact_count} of {len(candidates)} candidates"
+        blocks.append(
+            f"<footer>{match_note}. A CD TOC can be shared by multiple pressings; label, catalog number and barcode are candidate metadata.</footer>"
+        )
+    elif data.get("musicbrainz_id"):
+        message = "Release metadata is temporarily unavailable." if release_lookup_error else "No MusicBrainz release candidate is attached to this Disc ID / TOC yet."
+        blocks.append(f"<p><i>{message}</i></p>")
+
+    return {"html": "".join(blocks), "skip_entity_detection": True}
+
+
+async def send_rich_logcheck_message(
+    client: httpx.AsyncClient,
+    bot_token: str,
+    chat_id: int,
+    reply_to_message_id: int,
+    message_thread_id: int | None,
+    rich_message: dict[str, Any],
+) -> None:
+    """Publish a rich result through the Bot API, which Pyrofork does not expose."""
+    if not bot_token:
+        raise RichMessageError("Bot token is not configured")
+
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "rich_message": rich_message,
+        "reply_parameters": {
+            "message_id": reply_to_message_id,
+            "allow_sending_without_reply": True,
+        },
+    }
+    if message_thread_id:
+        payload["message_thread_id"] = message_thread_id
+
+    response = await client.post(
+        f"https://api.telegram.org/bot{bot_token}/sendRichMessage",
+        json=payload,
+    )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    if response.status_code >= 400 or not isinstance(body, dict) or not body.get("ok"):
+        description = body.get("description") if isinstance(body, dict) else None
+        raise RichMessageError(_text(description, f"Telegram Bot API returned HTTP {response.status_code}"))
 
 
 def format_logcheck_result(

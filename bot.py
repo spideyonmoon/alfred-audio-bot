@@ -33,7 +33,13 @@ from utils import progress_callback, safe_edit, safe_delete
 import health
 import cue_split
 import convert
-from logchecker import fetch_release_candidates, format_logcheck_result
+from logchecker import (
+    RichMessageError,
+    build_rich_logcheck_message,
+    fetch_release_candidates,
+    format_logcheck_result,
+    send_rich_logcheck_message,
+)
 
 env_path = Path(__file__).parent / ".env"
 load_dotenv(env_path)
@@ -1088,6 +1094,7 @@ async def logcheck_command(client: Client, message: Message):
 
         release_candidates = []
         release_lookup_error = False
+        rich_sent = False
         async with httpx.AsyncClient(timeout=30.0) as http:
             with open(file_path, "rb") as f:
                 resp = await http.post(_LOGCHECK_API, files={"logfile": (filename, f)})
@@ -1108,13 +1115,35 @@ async def logcheck_command(client: Client, message: Message):
                     release_lookup_error = True
                     logger.warning("MusicBrainz release lookup failed", exc_info=True)
 
-        text = format_logcheck_result(
-            data,
-            filename,
-            release_candidates,
-            release_lookup_error=release_lookup_error,
-        )
-        await safe_edit(status_msg, text, parse_mode=ParseMode.HTML)
+            rich_message = build_rich_logcheck_message(
+                data,
+                filename,
+                release_candidates,
+                release_lookup_error=release_lookup_error,
+            )
+            try:
+                await send_rich_logcheck_message(
+                    http,
+                    BOT_TOKEN or "",
+                    message.chat.id,
+                    message.id,
+                    message.message_thread_id,
+                    rich_message,
+                )
+                rich_sent = True
+            except (httpx.HTTPError, RichMessageError):
+                logger.warning("Rich log result failed; falling back to regular HTML", exc_info=True)
+
+        if rich_sent:
+            await safe_delete(status_msg)
+        else:
+            text = format_logcheck_result(
+                data,
+                filename,
+                release_candidates,
+                release_lookup_error=release_lookup_error,
+            )
+            await safe_edit(status_msg, text, parse_mode=ParseMode.HTML)
 
     except Exception as e:
         logger.exception("Log check error")

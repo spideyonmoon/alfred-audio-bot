@@ -1,11 +1,18 @@
 import asyncio
+import json
 import unittest
 from urllib.parse import parse_qs
 
 import httpx
 
 import logchecker
-from logchecker import fetch_release_candidates, format_logcheck_result, parse_release_candidates
+from logchecker import (
+    build_rich_logcheck_message,
+    fetch_release_candidates,
+    format_logcheck_result,
+    parse_release_candidates,
+    send_rich_logcheck_message,
+)
 
 
 LOGCHECK_RESPONSE = {
@@ -103,6 +110,33 @@ class LogcheckerTests(unittest.TestCase):
         self.assertIn("&lt;b&gt;not markup&lt;/b&gt;", result)
         self.assertNotIn("<b>not markup</b>", result)
 
+    def test_builds_compact_rich_message_with_release_cards(self):
+        candidates = parse_release_candidates(
+            MUSICBRAINZ_RESPONSE, LOGCHECK_RESPONSE["musicbrainz_id"]
+        )
+        rich_message = build_rich_logcheck_message(
+            LOGCHECK_RESPONSE, "Hats.log", candidates
+        )
+        html = rich_message["html"]
+
+        self.assertTrue(rich_message["skip_entity_detection"])
+        self.assertIn("<h3>Rip log report</h3>", html)
+        self.assertIn("<table compact><caption>Integrity</caption>", html)
+        self.assertIn("<details><summary><b>Database checks</b>", html)
+        self.assertIn("<details open><summary><b>1. RAYE", html)
+        self.assertIn("View this release on MusicBrainz", html)
+        self.assertIn("Exact Disc ID match.", html)
+        self.assertNotIn("<i>None</i>", html)
+
+    def test_rich_message_escapes_untrusted_text(self):
+        response = dict(LOGCHECK_RESPONSE)
+        response["details"] = ["<script>bad</script>"]
+        rich_message = build_rich_logcheck_message(response, "<log>.log")
+
+        self.assertIn("&lt;log&gt;.log", rich_message["html"])
+        self.assertIn("&lt;script&gt;bad&lt;/script&gt;", rich_message["html"])
+        self.assertNotIn("<script>bad</script>", rich_message["html"])
+
     def test_fetch_uses_toc_fallback_and_identifying_user_agent(self):
         seen = {}
 
@@ -123,6 +157,34 @@ class LogcheckerTests(unittest.TestCase):
         self.assertEqual(query["toc"], ["1+17+331818+150+5651"])
         self.assertEqual(query["cdstubs"], ["no"])
         self.assertIn("spideyonmoon/alfred-audio-bot", request.headers["User-Agent"])
+
+    def test_sends_rich_message_through_bot_api_with_reply_and_topic(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["request"] = request
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 101}})
+
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                await send_rich_logcheck_message(
+                    client,
+                    "test-token",
+                    -100123,
+                    44,
+                    77,
+                    {"html": "<h3>Report</h3>", "skip_entity_detection": True},
+                )
+
+        asyncio.run(run())
+        request = seen["request"]
+        payload = json.loads(request.content)
+
+        self.assertEqual(request.url.path, "/bottest-token/sendRichMessage")
+        self.assertEqual(payload["chat_id"], -100123)
+        self.assertEqual(payload["message_thread_id"], 77)
+        self.assertEqual(payload["reply_parameters"]["message_id"], 44)
+        self.assertTrue(payload["reply_parameters"]["allow_sending_without_reply"])
 
 
 if __name__ == "__main__":

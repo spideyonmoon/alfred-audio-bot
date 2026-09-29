@@ -8,7 +8,8 @@ Alfred is an **audio forensics Telegram bot**. Users reply to an audio file with
 
 ## Running & deploying
 
-There is **no build step and no test suite**. It's pure Python 3.11 + three system binaries.
+There is **no build step**. It is pure Python 3.11 plus three system binaries; run
+`python -m unittest discover -v` for the focused log-checker test suite.
 
 ```bash
 # Run the bot locally (needs .env populated — see below)
@@ -85,8 +86,8 @@ Each owns its own conversational state and exposes async handlers that `bot.py` 
 
 ## Conventions worth matching
 
-- **Telegram replies use HTML parse mode** (set globally on the `Client`), not Markdown. Use `<b>`, `<code>`, `<blockquote>`, etc.
-- **Roadmap — Rich Messages (Bot API 10.1):** `sendRichMessage` (headings, tables, collapsible `<details>` blocks) would be a great fit for the forensic result, but Pyrofork (MTProto) has no binding for it yet and its media blocks are HTTP-URL-only (can't embed the local spectrogram). Deferred until Pyrofork ships support; until then results use ordinary HTML formatting.
+- **Telegram replies use HTML parse mode** (set globally on the `Client`), not Markdown. Use `<b>`, `<code>`, `<blockquote>`, etc. `/log` is the exception: `logchecker.py` publishes its structured result through the Bot API's `sendRichMessage`, because Pyrofork has no binding for it. It must keep `format_logcheck_result` as a regular-HTML fallback and reply/topic routing must be passed explicitly to the Bot API.
+- **Rich-message scope:** `/log` uses headings, compact tables, and collapsible `<details>` blocks so database IDs and alternate pressings don't dominate the report. Do not use rich media blocks for locally generated spectrograms: Bot API rich media requires HTTP(S) URLs.
 - Wrap user-facing edits/deletes in `safe_edit` / `safe_delete` (utils) — they swallow `FloodWait` and stale-message errors.
 - All temp files live under `/tmp` (e.g. `/tmp/downloads/`); jobs clean up downloaded media and generated spectrograms in a `finally` block. The crash handler writes tracebacks to `/tmp/crash.log`, served at the health endpoint `/crash`.
 - Document-format validation is intentionally strict `.endswith(ext)` checks because Telegram strips extensions from native audio buffers — don't loosen these without understanding the supergroup/document-upload edge cases the git log documents.
