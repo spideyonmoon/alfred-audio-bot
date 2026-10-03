@@ -7,9 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mediainfo \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Non-root user. HuggingFace Spaces requires uid 1000; Render runs any uid, so the
-# same image works on both.
-RUN useradd -m -u 1000 alfred
+# Run the bot as a dedicated unprivileged user.
+RUN useradd -m alfred
 WORKDIR /home/alfred/app
 
 COPY requirements.txt .
@@ -17,12 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=alfred:alfred . .
 
-USER alfred
+RUN mkdir -p data && chown alfred:alfred data
 
-# Informational only: the app binds whatever the platform asks for — $PORT on Render,
-# defaulting to 7860 (HuggingFace Spaces' documented port) when nothing is injected.
-# EXPOSE is not what makes the port reachable on either platform.
-EXPOSE 7860
+USER alfred
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1

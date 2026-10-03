@@ -1,5 +1,9 @@
 # Secrets — never commit these
 .env
+.env.*
+!.env.example
+data/
+.venv/
 
 # Python
 __pycache__/

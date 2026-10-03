@@ -1,15 +1,3 @@
----
-title: Alfrerd
-emoji: 🔥
-colorFrom: yellow
-colorTo: yellow
-sdk: docker
-pinned: false
-license: mit
-short_description: Alfred — Audio Forensics Telegram Bot
-app_port: 7860
----
-
 # Alfred 🎧
 
 **Audio Forensics Telegram Bot** — powered by Pyrofork, FFmpeg, SoX, and MediaInfo.
@@ -33,50 +21,66 @@ app_port: 7860
 
 ---
 
-## Deployment
+## VPS setup
 
-The same image runs on **HuggingFace Spaces** and on **Render** (Docker service). The bot
-detects the host itself — no config needed for the port, which comes from `$PORT` on Render
-and defaults to `7860` on HuggingFace.
+Copy the example configuration and edit `.env`:
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `MAX_CONCURRENT_JOBS` | `1` | Concurrent analyses. Each peaks near 0.5 GB, so raise only with the RAM to back it. |
-| `HEALTH_PORT` | `$PORT`, else `7860` | Override the health-probe port. |
-| `HEALTH_SERVER` | `1` | `0` to disable the health endpoint (local runs). |
-| `SESSION_IN_MEMORY` | auto | `1`/`0` to force the session in memory or on disk. |
-
-**Render free tier:** the service sleeps after ~15 minutes without inbound HTTP traffic, and
-a Telegram connection doesn't count as HTTP. Point a free uptime pinger (UptimeRobot,
-cron-job.org, a GitHub Actions schedule) at the service URL every 5–10 minutes to keep it
-awake. The health endpoint answers `200` on any path; `/crash` serves the last startup
-traceback.
-
-**Memory:** a full-length analysis needs roughly 0.5 GB *inside the bot process*, plus the
-ffmpeg/sox children. That fits the free 512 MB instance only for shorter tracks — see
-`CLAUDE.md` for the details before raising `MAX_CONCURRENT_JOBS` or accepting longer files.
-
----
-
-## Secrets required (Space Settings → Variables and Secrets on HuggingFace; Environment on Render)
-
-| Secret | Description |
-|---|---|
-| `API_ID` | Telegram API ID from [my.telegram.org](https://my.telegram.org) |
-| `API_HASH` | Telegram API hash |
-| `BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) |
-| `TELEGRAPH_TOKEN` | Telegraph access token (optional) |
-| `ALLOWED_CHATS` | JSON: `{"-100chatid": [0, topic_id]}` |
-| `ALLOWED_TOPICS` | JSON: `[topic_id1, topic_id2]` |
-| `ADMIN_IDS` | JSON: `[userid1, userid2]` (these users bypass chat checks) |
-
----
-
-## ALLOWED_CHATS Format
-
-```json
-{"-1001234567890": [0, 123, 456]}
+```bash
+cp .env.example .env
+chmod 600 .env
+nano .env
 ```
 
-- Use `0` for the general (non-topic) chat
-- Topic IDs: forward a message from the topic to @userinfobot
+Set `BOT_TOKEN` from [BotFather](https://t.me/BotFather) and `API_ID` / `API_HASH`
+from [my.telegram.org](https://my.telegram.org). The bot loads `.env` beside `bot.py`
+before reading any settings. Values in that file take precedence over shell variables.
+
+Access uses plain comma-separated IDs, with no JSON or topic configuration:
+
+```dotenv
+ADMIN_IDS=123456789,987654321
+ALLOWED_CHATS=-1001234567890,-1009876543210
+```
+
+Admins may use the bot in any chat. Other users may use it in an allowed chat,
+including any topics it has. Blank lists grant no access; with both blank, nobody
+can use privileged commands. To allow a private conversation, add its user/chat ID
+or make that user an admin. Replace the old JSON values when migrating and remove
+`ALLOWED_TOPICS`, `SESSION_IN_MEMORY`, `HEALTH_SERVER`, and `HEALTH_PORT` from `.env`.
+
+`TELEGRAPH_TOKEN` is optional. `MAX_CONCURRENT_JOBS` defaults to 1; each analysis can
+use roughly 0.5 GB of RAM, so increase it according to available VPS memory.
+`AF_EXTRACTORS` defaults to 4 and `PROGRESS_UPDATE_INTERVAL` to 8 seconds.
+Invalid access lists or bot tuning values stop startup with the setting's name.
+
+### Docker Compose
+
+With Docker and Compose installed on the VPS:
+
+```bash
+docker compose up -d --build
+docker compose logs -f alfred
+```
+
+Compose reads `.env`, restarts the bot after crashes or host reboots, and stores the
+Telegram session in the `alfred-data` volume. No HTTP server or exposed port is needed.
+After editing `.env`, run `docker compose up -d --force-recreate` to apply the settings.
+Rebuild after code changes with `docker compose up -d --build`.
+The Docker build excludes `.env` and session files.
+
+### Run directly
+
+Install Python 3.11+ and the system tools, then run from the repository:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv ffmpeg sox mediainfo
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python bot.py
+```
+
+The session is saved under `data/` beside `bot.py`; the process must be able to write
+there. Restart the process after editing `.env`. For a continuously running direct
+installation, use a systemd service with the virtualenv Python and this repository
+as its working directory. Startup failures exit with a traceback in the process logs.

@@ -1,5 +1,4 @@
 import math
-import os
 import time
 from typing import Optional
 from pyrogram.types import Message
@@ -11,7 +10,7 @@ from pyrogram.enums import ParseMode
 # Telegram throttles message edits *per chat*, and we can have up to
 # MAX_CONCURRENT_JOBS all editing in the same group at once — so a tight
 # interval here multiplies into a FloodWait storm. Keep this generous.
-PROGRESS_UPDATE_INTERVAL = float(os.getenv("PROGRESS_UPDATE_INTERVAL", "8.0"))
+from config import PROGRESS_UPDATE_INTERVAL
 
 # Hard cap on how long a *progress* edit may block. With the client's
 # sleep_threshold set, Pyrogram would otherwise sleep through a FloodWait

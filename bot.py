@@ -21,7 +21,10 @@ try:
 except ImportError:
     psutil = None
 
-from dotenv import load_dotenv
+from config import (
+    ALLOWED_CHATS, ADMIN_IDS, MAX_CONCURRENT_JOBS, SESSION_DIR,
+    telegram_credentials,
+)
 import httpx
 
 from pyrogram import Client, filters
@@ -30,7 +33,6 @@ from pyrogram.enums import ParseMode
 
 from af2 import build_report, build_info_report, ForensicReport, generate_spectrogram, compare_reports
 from utils import progress_callback, safe_edit, safe_delete
-import health
 import cue_split
 import convert
 from logchecker import (
@@ -41,22 +43,8 @@ from logchecker import (
     send_rich_logcheck_message,
 )
 
-env_path = Path(__file__).parent / ".env"
-load_dotenv(env_path)
+BOT_TOKEN, API_ID, API_HASH = telegram_credentials()
 
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
-API_ID      = os.getenv("API_ID")
-API_HASH    = os.getenv("API_HASH")
-
-ALLOWED_CHATS: dict[int, set] = {}
-try:
-    raw_chats = json.loads(os.getenv("ALLOWED_CHATS", "{}"))
-    ALLOWED_CHATS = {int(cid): set(topics) for cid, topics in raw_chats.items()}
-except json.JSONDecodeError:
-    pass
-
-ALLOWED_TOPICS: set = set(json.loads(os.getenv("ALLOWED_TOPICS", "[]")))
-ADMIN_IDS: set[int] = set(json.loads(os.getenv("ADMIN_IDS", "[]")))
 MAX_FILE_SIZE_MB = 1500
 COMPARE_TIMEOUT_SEC = 30
 
@@ -68,42 +56,11 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-def _env_flag(name: str, default: bool) -> bool:
-    """Read a boolean env var, accepting the usual on/off spellings."""
-    raw = os.getenv(name, "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:  return True
-    if raw in {"0", "false", "no", "off"}: return False
-    return default
-
-def _env_int(name: str, default: int, minimum: int = 1) -> int:
-    """Read an integer env var, falling back to `default` if unset or unparseable."""
-    try:
-        return max(minimum, int(os.getenv(name, "").strip()))
-    except (TypeError, ValueError):
-        return default
-
-def _detect_platform() -> str:
-    """Which host we're running on: 'huggingface', 'render', or 'local'.
-
-    Both cloud platforms give the container an ephemeral filesystem, which matters for
-    where the Pyrogram session lives — a `.session` file there is wiped on every redeploy.
-    """
-    if os.getenv("SPACE_ID"): return "huggingface"
-    if any(os.getenv(v) for v in ("RENDER", "RENDER_SERVICE_ID", "RENDER_EXTERNAL_URL")):
-        return "render"
-    return "local"
-
-PLATFORM = _detect_platform()
-# Keep the session in memory on ephemeral-filesystem hosts (see _detect_platform).
-# SESSION_IN_MEMORY=0/1 overrides the detection if a host needs the other behaviour.
-SESSION_IN_MEMORY = _env_flag("SESSION_IN_MEMORY", PLATFORM != "local")
-# Health endpoint: enabled by default everywhere so the platform's port probe — and any
-# uptime pinger — gets an answer. HEALTH_SERVER=0 disables it for local runs.
-HEALTH_SERVER_ENABLED = _env_flag("HEALTH_SERVER", True)
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Client(
-    name=":memory:" if SESSION_IN_MEMORY else "alfred_session",
-    in_memory=SESSION_IN_MEMORY,
+    name="alfred_session",
+    workdir=str(SESSION_DIR),
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
@@ -122,12 +79,7 @@ _total_analyses = 0
 _task_queue: asyncio.Queue = asyncio.Queue()
 _user_queue_counts: defaultdict[int, int] = defaultdict(int)
 MAX_QUEUE_PER_USER = 5
-# Concurrent analyses. Each job runs build_report() inside this process, holding the
-# decoded track plus its STFT — roughly 0.5 GB for a full-length track. Four workers
-# therefore want ~2 GB, which gets the container OOM-killed on small instances (Render's
-# free tier gives 512 MB). Default to one so the queue serialises the wait instead of the
-# kernel killing the bot; raise MAX_CONCURRENT_JOBS on a host with the RAM for it.
-MAX_CONCURRENT_JOBS = _env_int("MAX_CONCURRENT_JOBS", 1)
+# Each concurrent analysis can use roughly 0.5 GB; tune for the VPS RAM.
 _active_jobs: dict[str, dict] = {}
 _compare_sessions: dict[tuple[int, int, int], dict] = {}
 
@@ -142,20 +94,10 @@ def _check_auth(message: Message) -> bool:
     if message.from_user and message.from_user.id in ADMIN_IDS:
         return True
 
-    chat_id  = message.chat.id
-    topic_id = message.message_thread_id or 0
-    if chat_id not in ALLOWED_CHATS:
-        return False
-    allowed_topics = ALLOWED_CHATS.get(chat_id, set())
-    return topic_id in allowed_topics or topic_id in ALLOWED_TOPICS
+    return message.chat.id in ALLOWED_CHATS
 
 async def _reject_auth(message: Message) -> None:
-    chat_id  = message.chat.id
-    topic_id = message.message_thread_id or 0
-    if chat_id not in ALLOWED_CHATS:
-        await message.reply("❌ <b>Not authorized.</b> This bot is not enabled for this chat.")
-    else:
-        await message.reply("❌ <b>Not authorized.</b> This bot is not enabled in this topic.")
+    await message.reply("❌ <b>Not authorized.</b> This bot is not enabled for this chat.")
 
 # ---------------------------------------------------------------------------
 # Telegraph
@@ -1408,14 +1350,6 @@ async def _on_start():
     then spawn the worker and idle."""
     from pyrogram import idle
 
-    # Start the minimal health server IMMEDIATELY — before Pyrogram blocks negotiating
-    # the MTProto connection to Telegram — so the platform's startup/port probe passes.
-    # Render routes to $PORT; HuggingFace Spaces and local runs use 7860.
-    if HEALTH_SERVER_ENABLED:
-        port = health.resolve_port()
-        asyncio.create_task(health.start_health_server(port=port))
-        logger.info("Platform: %s — health server started on :%d", PLATFORM, port)
-
     if psutil is not None:
         # Each analysis needs several hundred MB; surfacing the budget at startup makes a
         # too-high MAX_CONCURRENT_JOBS obvious before it becomes an OOM kill.
@@ -1439,19 +1373,4 @@ async def _on_start():
             board_task.cancel()
 
 if __name__ == "__main__":
-    if not BOT_TOKEN or not API_ID or not API_HASH:
-        logger.error("Missing critical environment variables (BOT_TOKEN, API_ID, or API_HASH).")
-    else:
-        try:
-            app.run(_on_start())
-        except Exception as e:
-            import traceback
-            import health
-            with open("/tmp/crash.log", "w", encoding="utf-8") as f:
-                traceback.print_exc(file=f)
-            logger.error("Fatal startup error. Storing traceback to /tmp/crash.log and starting debug health server.")
-            async def serve_crash():
-                # Keep the port probe answering even while the bot is down, so the
-                # platform's log/health surface stays reachable for debugging.
-                await health.start_health_server()
-            asyncio.run(serve_crash())# cache breaker 123
+    app.run(_on_start())

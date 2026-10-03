@@ -22,7 +22,7 @@ python af2.py track.flac --json           # machine-readable JSON
 python af2.py track.flac --fast           # analyse first 60s only
 python af2.py track.flac --info           # metadata only, skip DSP
 
-# Containerized (the same image runs on HuggingFace Spaces and Render)
+# Containerized on a VPS
 docker compose up --build
 ```
 
@@ -32,32 +32,26 @@ docker compose up --build
 
 ### Environment
 
-`.env` (gitignored) must define: `BOT_TOKEN`, `API_ID`, `API_HASH`. Optional: `TELEGRAPH_TOKEN` (forensic text reports are uploaded to telegra.ph), `ALLOWED_CHATS`, `ALLOWED_TOPICS`, `ADMIN_IDS` (all JSON — see README for the `ALLOWED_CHATS` topic-id format).
-
-Deployment tuning knobs (all optional, defaults are safe for a small instance):
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `MAX_CONCURRENT_JOBS` | `1` | Concurrent analyses. Each holds ~0.5 GB, so raise this only on a host with the RAM. |
-| `HEALTH_PORT` | `$PORT`, else `7860` | Overrides the health/port probe port. |
-| `HEALTH_SERVER` | `1` | Set `0` to skip the health server (local runs). |
-| `SESSION_IN_MEMORY` | auto | `1`/`0` to force the Pyrogram session in memory or on disk. |
+`.env` (gitignored) must define `BOT_TOKEN`, `API_ID`, and `API_HASH`.
+`config.py` loads it before dependent modules, with file values taking precedence over
+shell variables. Optional `TELEGRAPH_TOKEN` enables telegra.ph reports. `ALLOWED_CHATS`
+and `ADMIN_IDS` are comma-separated numeric IDs; blank means no access. There is no
+topic allowlist. Optional tuning: `MAX_CONCURRENT_JOBS=1`, `AF_EXTRACTORS=4`, and
+`PROGRESS_UPDATE_INTERVAL=8.0`. Invalid access lists and bot tuning values fail startup.
 
 ### Hosting
 
-The bot runs on HuggingFace Spaces and on Render, and detects which (`_detect_platform()` in `bot.py`) from `SPACE_ID` / `RENDER_SERVICE_ID`. Both give the container an **ephemeral filesystem**, so the Pyrogram session is kept in memory (`:memory:`) rather than written to a `.session` file that would be wiped on every redeploy. Locally it persists to `alfred_session.session`.
-
-The health HTTP server starts *before* the MTProto connection is negotiated, so the platform's port probe passes immediately. It answers 200 on every path (`/` and `/health` alike) and serves the crash traceback at `/crash`. The port comes from `health.resolve_port()`: `$PORT` (Render's convention) → `HEALTH_PORT` → 7860 (HuggingFace's convention).
-
-**Render free-tier spin-down:** free web services sleep after ~15 minutes without *inbound HTTP* traffic, and Telegram's MTProto connection does not count as HTTP traffic. Keep it awake with an external pinger (UptimeRobot, cron-job.org, a GitHub Actions cron) hitting the health URL every 5–10 minutes; the endpoint is deliberately cheap so this costs nothing.
-
-**Memory is the binding constraint on a small instance.** One full-length analysis peaks around 450-500 MB resident (measured on a 7-minute FLAC) *inside the bot process*, plus ffmpeg/sox children. Render's free tier gives 512 MB total, so a single long track can still get the container OOM-killed — see the queue section below before raising concurrency or accepting longer files.
+Deploy on a VPS using Docker Compose or a Python virtualenv (see README).
+The session persists under `data/`; Compose mounts a named volume there. The Docker
+build excludes credentials and sessions. The bot has no HTTP server or hosting-platform
+detection. Startup failures exit normally with a traceback for the process supervisor.
+Each concurrent analysis can use roughly 0.5 GB; size the worker count for the VPS RAM.
 
 ## Architecture
 
 ### Central queue, `MAX_CONCURRENT_JOBS` workers (`bot.py`)
 
-Every long-running command (`/fs`, `/cnv`, `/cue`) is funneled through **one shared `asyncio.Queue`** drained by `MAX_CONCURRENT_JOBS` `_queue_worker()` coroutines spawned in `_on_start()`. That count defaults to **1** (env-overridable): `build_report()` runs *in the bot's own process* via `asyncio.to_thread`, holding the decoded track plus its STFT — roughly 0.5 GB for a full-length track. Four workers want ~2 GB and get the container OOM-killed on a 512 MB instance, so the queue serialises the wait instead. Raise the variable only alongside the RAM. Command handlers do **not** do work directly — they build a **job dict** and call `enqueue_universal_task(job, ctx)`. The worker dispatches on `job["type"]` (`"fs"` / `"cnv"` / `"cue"`) to the matching runner (`_run_forensic_job`, `convert._run_convert_job`, `cue_split._run_cue_job`).
+Every long-running command (`/fs`, `/cnv`, `/cue`) is funneled through **one shared `asyncio.Queue`** drained by `MAX_CONCURRENT_JOBS` `_queue_worker()` coroutines spawned in `_on_start()`. That count defaults to **1** (env-overridable): `build_report()` runs *in the bot's own process* via `asyncio.to_thread`, holding the decoded track plus its STFT — roughly 0.5 GB for a full-length track. Four workers can need ~2 GB, so the default queue serialises the work. Raise the variable only alongside the RAM. Command handlers do **not** do work directly — they build a **job dict** and call `enqueue_universal_task(job, ctx)`. The worker dispatches on `job["type"]` (`"fs"` / `"cnv"` / `"cue"`) to the matching runner (`_run_forensic_job`, `convert._run_convert_job`, `cue_split._run_cue_job`).
 
 Key invariants when touching the queue path:
 - A job dict carries `type`, `user_id`, `filename`, and a per-type `payload`/fields. `enqueue_universal_task` stamps it with a 6-char `job_id`, registers it in the global `_active_jobs` map, enforces `MAX_QUEUE_PER_USER` (5), and attaches the `status_msg` to edit.
@@ -79,7 +73,7 @@ Each owns its own conversational state and exposes async handlers that `bot.py` 
 
 ### Auth gate
 
-`_check_auth(message)` runs at the top of every privileged command. `ADMIN_IDS` bypass all checks; everyone else must be in an allowed (chat, topic) pair. Telegram supergroup **topic threads** matter throughout — but the rule is precise:
+`_check_auth(message)` runs at the top of every privileged command. `ADMIN_IDS` bypass all checks; everyone else must be in an allowed chat. Authorization does not restrict topics. Telegram reply routing still preserves thread context:
 
 - **`client.send_*(chat_id=..., message_thread_id=thread_id, ...)`** — must pass `message_thread_id` explicitly, no implicit context.
 - **`message.reply_*(...)` / `message.reply_audio(...)` etc.** — must NOT pass `message_thread_id`. Pyrogram derives the thread from the reply anchor automatically, and the kwarg is not accepted by these methods (raises `TypeError` at runtime).
@@ -89,6 +83,6 @@ Each owns its own conversational state and exposes async handlers that `bot.py` 
 - **Telegram replies use HTML parse mode** (set globally on the `Client`), not Markdown. Use `<b>`, `<code>`, `<blockquote>`, etc. `/log` is the exception: `logchecker.py` publishes its structured result through the Bot API's `sendRichMessage`, because Pyrofork has no binding for it. It must keep `format_logcheck_result` as a regular-HTML fallback and reply/topic routing must be passed explicitly to the Bot API.
 - **Rich-message scope:** `/log` uses headings, compact tables, and collapsible `<details>` blocks so database IDs and alternate pressings don't dominate the report. Do not use rich media blocks for locally generated spectrograms: Bot API rich media requires HTTP(S) URLs.
 - Wrap user-facing edits/deletes in `safe_edit` / `safe_delete` (utils) — they swallow `FloodWait` and stale-message errors.
-- All temp files live under `/tmp` (e.g. `/tmp/downloads/`); jobs clean up downloaded media and generated spectrograms in a `finally` block. The crash handler writes tracebacks to `/tmp/crash.log`, served at the health endpoint `/crash`.
+- All temp files live under `/tmp` (e.g. `/tmp/downloads/`); jobs clean up downloaded media and generated spectrograms in a `finally` block. Startup failures are written to the process logs.
 - Document-format validation is intentionally strict `.endswith(ext)` checks because Telegram strips extensions from native audio buffers — don't loosen these without understanding the supergroup/document-upload edge cases the git log documents.
 - Throttle: `progress_callback` only edits the status message every 3s to avoid FloodWait.
